@@ -2,9 +2,11 @@ services:
   attendee-worker-local:
     build: ./
     volumes:
-     - .:/attendee
+      - .:/attendee
     networks:
       - attendee_network
+    env_file:
+      - .env
     environment:
       - POSTGRES_HOST=postgres
       - REDIS_URL=redis://redis:6379/5
@@ -15,9 +17,11 @@ services:
   attendee-scheduler-local:
     build: ./
     volumes:
-     - .:/attendee
+      - .:/attendee
     networks:
       - attendee_network
+    env_file:
+      - .env
     environment:
       - POSTGRES_HOST=postgres
       - REDIS_URL=redis://redis:6379/5
@@ -28,11 +32,13 @@ services:
   attendee-app-local:
     build: ./
     volumes:
-     - .:/attendee
+      - .:/attendee
     networks:
       - attendee_network
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       - POSTGRES_HOST=postgres
       - REDIS_URL=redis://redis:6379/5
@@ -43,11 +49,13 @@ services:
   attendee-webpage-streamer-local:
     build: ./
     volumes:
-     - .:/attendee
+      - .:/attendee
     networks:
       - attendee_network
     ports:
       - "8001:8000"
+    env_file:
+      - .env
     environment:
       - DJANGO_SETTINGS_MODULE=attendee.settings.development
       - ENABLE_CHROME_SANDBOX=true
@@ -57,6 +65,37 @@ services:
     profiles:
       - webpage-streamer
 
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio:/data
+    networks:
+      - attendee_network
+    restart: unless-stopped
+
+  minio-create-buckets:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      - minio
+    networks:
+      - attendee_network
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      until (mc alias set local http://minio:9000 minioadmin minioadmin) do echo 'waiting for minio...' && sleep 1; done;
+      mc mb -p local/attendee-recordings || true;
+      mc mb -p local/attendee-audio-chunks || true;
+      mc anonymous set download local/attendee-recordings || true;
+      mc anonymous set download local/attendee-audio-chunks || true;
+      echo 'minio buckets ready';
+      "
 
   postgres:
     image: postgres:15.3-alpine
@@ -66,11 +105,10 @@ services:
       POSTGRES_PASSWORD: attendee_development_user
       PGDATA: /data/postgres
     volumes:
-       - postgres:/data/postgres
+      - postgres:/data/postgres
     networks:
       - attendee_network
     restart: unless-stopped
-
 
   redis:
     image: redis:7-alpine
@@ -87,3 +125,4 @@ networks:
 volumes:
   postgres:
   redis:
+  minio:
