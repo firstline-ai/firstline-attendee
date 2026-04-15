@@ -18,7 +18,7 @@ services:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
     command: >
       gunicorn attendee.wsgi:application
-        --bind 0.0.0.0:8000 --workers 4 --timeout 120
+        --bind 127.0.0.1:8000 --workers 4 --timeout 120
     depends_on: [postgres, redis]
 
   attendee-worker:
