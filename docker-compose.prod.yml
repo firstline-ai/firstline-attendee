@@ -1,0 +1,90 @@
+# docker-compose.prod.yml
+#
+# Todos os serviços usam network_mode: host porque os bots efêmeros são lançados
+# com network_mode: host (via Docker socket), então precisam alcançar postgres/redis
+# via localhost. A rede bridge impediria a resolução dos service names nesses containers.
+#
+# Segurança: postgres e redis ficam vinculados em 127.0.0.1 — não expostos externamente.
+# MinIO fica em 0.0.0.0 para que URLs pré-assinadas de gravações sejam acessíveis.
+# Configure o firewall para bloquear acesso externo às portas 5432, 6379 se necessário.
+
+services:
+  attendee-app:
+    image: firstline-attendee:latest
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+    command: >
+      gunicorn attendee.wsgi:application
+        --bind 0.0.0.0:8000 --workers 4 --timeout 120
+    depends_on: [postgres, redis]
+
+  attendee-worker:
+    image: firstline-attendee:latest
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      ENABLE_CHROME_SANDBOX: "false"
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
+      BOT_MEMORY_LIMIT: "2g"
+      BOT_CPU_QUOTA: "100000" # 1 vCPU por bot
+      BOT_MAX_SIMULTANEOUS_BOTS: "8"
+      BOT_CONTAINER_IMAGE: "firstline-attendee:latest"
+      # Caminho no HOST onde o código foi clonado (onde está o manage.py)
+      # Ajuste para o caminho real no servidor de produção
+      BOT_HOST_CODE_PATH: "/home/deploy/apps/attendee"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # -Q celery,bot_launcher_vm: obrigatório para receber tarefas de lançamento de bots
+    command: celery -A attendee worker -l INFO -Q celery,bot_launcher_vm
+    depends_on: [postgres, redis]
+
+  attendee-scheduler:
+    image: firstline-attendee:latest
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+    entrypoint: []
+    command: python manage.py run_scheduler
+    depends_on: [postgres, redis]
+
+  postgres:
+    image: postgres:15.3-alpine
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      PGDATA: /data/postgres
+    # listen_addresses=127.0.0.1 garante que postgres não fica exposto externamente
+    command: postgres -c listen_addresses=127.0.0.1
+    volumes:
+      - postgres_data:/data/postgres
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    network_mode: host
+    # --bind 127.0.0.1 garante que redis não fica exposto externamente
+    command: redis-server --save 60 1 --loglevel warning --bind 127.0.0.1
+    volumes:
+      - redis_data:/data/redis
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: always
+    network_mode: host
+    command: server /data --console-address ":9001"
+    env_file: .env.prod
+    volumes:
+      - minio_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
