@@ -1,10 +1,13 @@
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
 import string
 from datetime import timedelta
+
+logger = logging.getLogger(__name__)
 
 from concurrency.exceptions import RecordModifiedError
 from concurrency.fields import IntegerVersionField
@@ -1806,6 +1809,15 @@ class BotEventManager:
 
                     if new_state == BotStates.FATAL_ERROR:
                         cls.after_new_state_is_fatal_error(bot=bot, event_type=event_type, event_sub_type=event_sub_type, new_state=new_state)
+
+                    # Watchdog: agenda kill se bot ficar preso em JOINING.
+                    if new_state == BotStates.JOINING and old_state != BotStates.JOINING:
+                        try:
+                            from bots.tasks.joining_watchdog_task import kill_stuck_joining_bot
+
+                            kill_stuck_joining_bot.apply_async(args=[bot.id], countdown=600)
+                        except Exception as e:
+                            logger.error(f"Failed to schedule joining watchdog for bot {bot.id}: {e}")
 
                     # If we transitioned to a post meeting state
                     transitioned_to_post_meeting_state = cls.is_post_meeting_state(new_state) and not cls.is_post_meeting_state(old_state)
