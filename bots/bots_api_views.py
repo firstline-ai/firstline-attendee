@@ -432,6 +432,7 @@ class OutputVideoView(APIView):
             media_type=BotMediaRequestMediaTypes.VIDEO,
             media_url=serializer.validated_data["url"],
             loop=serializer.validated_data["loop"],
+            mute_video=serializer.validated_data["mute_video"],
         )
 
         # Send sync command to notify bot of new media request
@@ -1364,7 +1365,7 @@ class PauseRecordingView(APIView):
     @extend_schema(
         operation_id="Pause Recording",
         summary="Pause the bot's recording",
-        description="Pauses the recording for the specified bot. This functionality is in beta and only supported for Google Meet and MS Teamsbots.",
+        description="Pauses the recording for the specified bot.",
         responses={
             200: OpenApiResponse(
                 response=BotSerializer,
