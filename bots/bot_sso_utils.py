@@ -254,7 +254,7 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
                 "authn_auth": IDP_ENTITY_ID,
             },
             sign_assertion=True,
-            sign_response=True,
+            sign_response=False,
             sign_alg="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             digest_alg="http://www.w3.org/2001/04/xmlenc#sha256",
             assertion_ttl=int(timedelta(minutes=5).total_seconds()),
