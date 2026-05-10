@@ -71,16 +71,19 @@ class GoogleMeetSignInView(View):
             return HttpResponseBadRequest("Missing SAMLRequest")
 
         # Create and sign the SAMLResponse
+        logger.error(f"[DEBUG] Attempting to build SAMLResponse for email={google_meet_bot_login.email}")
         try:
             credentials = google_meet_bot_login.get_credentials() or {}
+            logger.error(f"[DEBUG] Credentials fetched, cert_present={bool(credentials.get('cert'))}, key_present={bool(credentials.get('private_key'))}")
             saml_response_b64, acs_url = _build_sign_in_saml_response(
                 saml_request_b64=saml_request_b64,
                 email_to_sign_in=google_meet_bot_login.email,
                 cert=credentials.get("cert"),
                 private_key=credentials.get("private_key"),
             )
+            logger.error(f"[DEBUG] SAMLResponse built successfully, acs_url={acs_url}")
         except Exception as e:
-            logger.exception(f"Failed to create SAMLResponse: {e}")
+            logger.error(f"[DEBUG] EXCEPTION in _build_sign_in_saml_response: {type(e).__name__}: {e}", exc_info=True)
             return HttpResponseBadRequest("Failed to create SAMLResponse. Private Key or Cert may be invalid.")
 
         # 6) Return auto-posting HTML to the ACS
