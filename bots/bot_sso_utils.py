@@ -201,6 +201,11 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
     # 1) Inflate + parse the AuthnRequest
     try:
         xml_bytes = _inflate_redirect_binding(saml_request_b64)
+        try:
+            with open("/tmp/saml_authnrequest_dump.xml", "wb") as f:
+                f.write(xml_bytes)
+        except Exception:
+            pass
         authn = _parse_authn_request(xml_bytes)
     except Exception as e:
         raise ValueError(f"Failed to decode/parse SAMLRequest: {e}")
@@ -259,7 +264,7 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
             digest_alg="http://www.w3.org/2001/04/xmlenc#sha256",
             assertion_ttl=int(timedelta(minutes=5).total_seconds()),
             binding=BINDING_HTTP_POST,
-            audience_restriction=[sp_entity_id],
+            audience_restriction=[sp_entity_id, "google.com"],
         )
 
         resp_xml = saml_resp
