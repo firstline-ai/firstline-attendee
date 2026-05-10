@@ -50,23 +50,24 @@ class GoogleMeetSignInView(View):
     """
 
     def get(self, request):
+        logger.error(f"[DEBUG] GoogleMeetSignInView called. cookies={list(request.COOKIES.keys())} has_saml={'SAMLRequest' in request.GET}")
         # Get the session_id from the cookie
         session_id = request.COOKIES.get("google_meet_sign_in_session_id")
         if not session_id:
-            logger.warning("GoogleMeetSignInView could not sign in: session_id is missing")
+            logger.error("GoogleMeetSignInView could not sign in: session_id is missing")
             return HttpResponseBadRequest("Could not sign in")
 
         # Get the google meet bot login to use from the session id
         google_meet_bot_login = get_bot_login_for_google_meet_sign_in_session(session_id)
         if not google_meet_bot_login:
-            logger.warning("GoogleMeetSignInView could not sign in: no bot login found for session_id")
+            logger.error("GoogleMeetSignInView could not sign in: no bot login found for session_id")
             return HttpResponseBadRequest("Could not sign in")
 
         saml_request_b64 = request.GET.get("SAMLRequest")
         relay_state = request.GET.get("RelayState")
 
         if not saml_request_b64:
-            logger.warning("GoogleMeetSignInView could not sign in: SAMLRequest is missing")
+            logger.error("GoogleMeetSignInView could not sign in: SAMLRequest is missing")
             return HttpResponseBadRequest("Missing SAMLRequest")
 
         # Create and sign the SAMLResponse
