@@ -264,6 +264,11 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
         saml_response_b64 = base64.b64encode(resp_xml.encode("utf-8")).decode("ascii")
 
         logger.error(f"[SAML_DUMP] sp_entity_id={sp_entity_id} acs_url={acs_url} in_response_to={in_response_to}")
-        logger.error(f"[SAML_DUMP] response_xml={resp_xml}")
+        try:
+            with open("/tmp/saml_response_dump.xml", "w", encoding="utf-8") as f:
+                f.write(resp_xml)
+            logger.error("[SAML_DUMP] response XML written to /tmp/saml_response_dump.xml")
+        except Exception as e:
+            logger.error(f"[SAML_DUMP] failed to write XML to file: {e}")
 
         return saml_response_b64, acs_url
