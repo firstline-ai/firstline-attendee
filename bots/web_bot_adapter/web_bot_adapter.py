@@ -614,8 +614,10 @@ class WebBotAdapter(BotAdapter):
         prefs = {
             "credentials_enable_service": False,
             "profile.password_manager_enabled": False,
+            "intl.accept_languages": "en-US,en",
         }
         options.add_experimental_option("prefs", prefs)
+        options.add_argument("--lang=en-US")
 
         self.add_subclass_specific_chrome_options(options)
 
