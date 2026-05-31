@@ -20,6 +20,7 @@ from accounts.models import User, UserRole
 
 from .bots_api_utils import BotCreationSource, create_bot, create_webhook_subscription
 from .launch_bot_utils import launch_bot
+from .meeting_url_utils import meeting_type_from_url
 from .models import (
     ApiKey,
     Bot,
@@ -37,6 +38,7 @@ from .models import (
     ChatMessage,
     Credentials,
     CreditTransaction,
+    MeetingTypes,
     Participant,
     ParticipantEventTypes,
     Project,
@@ -1286,6 +1288,8 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "meeting_url": request.POST.get("meeting_url"),
                 "bot_name": request.POST.get("bot_name") or "Meeting Bot",
             }
+            if meeting_type_from_url(data["meeting_url"]) == MeetingTypes.GOOGLE_MEET and BotLoginGroup.first_available_login(project=project, platform=BotLoginPlatform.GOOGLE_MEET):
+                data["google_meet_settings"] = {"use_login": True}
 
             bot, error = create_bot(data=data, source=BotCreationSource.DASHBOARD, project=project)
             if error:
