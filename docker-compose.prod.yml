@@ -34,7 +34,7 @@ services:
       LAUNCH_BOT_METHOD: docker-compose-multi-host
       BOT_MEMORY_LIMIT: "2g"
       BOT_CPU_QUOTA: "100000" # 1 vCPU por bot
-      BOT_MAX_SIMULTANEOUS_BOTS: "8"
+      BOT_MAX_SIMULTANEOUS_BOTS: "10"
       BOT_CONTAINER_IMAGE: "firstline-attendee:latest"
       # Caminho no HOST onde o código foi clonado (onde está o manage.py)
       # Ajuste para o caminho real no servidor de produção
