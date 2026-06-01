@@ -241,6 +241,16 @@ def get_elevenlabs_language_codes():
 from .meeting_url_utils import meeting_type_from_url, normalize_meeting_url
 from .utils import is_valid_image, transcription_provider_from_bot_creation_data
 
+DEFAULT_GOOGLE_MEET_LANGUAGE = "pt-BR"
+
+
+def default_google_meet_transcription_settings():
+    if os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_URL"):
+        return {"custom_async": {"language": DEFAULT_GOOGLE_MEET_LANGUAGE}}
+
+    return {"meeting_closed_captions": {"google_meet_language": DEFAULT_GOOGLE_MEET_LANGUAGE}}
+
+
 # Define the schema once
 BOT_IMAGE_SCHEMA = {
     "type": "object",
@@ -1353,7 +1363,7 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
                 else:
                     value = {"deepgram": {"language": "multi"}}
             elif meeting_type == MeetingTypes.GOOGLE_MEET:
-                value = {"meeting_closed_captions": {}}
+                value = default_google_meet_transcription_settings()
             elif meeting_type == MeetingTypes.TEAMS:
                 value = {"meeting_closed_captions": {}}
             else:
