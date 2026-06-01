@@ -4,7 +4,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from accounts.models import Organization, User, UserRole
-from bots.models import Bot, BotLogin, BotLoginGroup, BotLoginPlatform, Project
+from bots.models import Bot, BotLogin, BotLoginGroup, BotLoginPlatform, Project, RecordingFormats, RecordingTypes
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
@@ -47,6 +47,8 @@ class CreateBotViewTest(TestCase):
         self.assertTrue(bot.settings["google_meet_settings"]["use_login"])
         self.assertEqual(bot.settings["google_meet_settings"]["login_mode"], "always")
         self.assertIsNone(bot.settings["google_meet_settings"]["login_group_name"])
+        self.assertEqual(bot.recording_format(), RecordingFormats.MP3)
+        self.assertEqual(bot.recording_type(), RecordingTypes.AUDIO_ONLY)
         mock_launch_bot.assert_called_once_with(bot)
 
     @patch("bots.projects_views.launch_bot")
@@ -62,4 +64,6 @@ class CreateBotViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         bot = Bot.objects.get(project=self.project, meeting_url="https://meet.google.com/abc-defg-hij")
         self.assertFalse(bot.settings["google_meet_settings"]["use_login"])
+        self.assertEqual(bot.recording_format(), RecordingFormats.MP3)
+        self.assertEqual(bot.recording_type(), RecordingTypes.AUDIO_ONLY)
         mock_launch_bot.assert_called_once_with(bot)

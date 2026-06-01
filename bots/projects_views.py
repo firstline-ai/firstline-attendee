@@ -44,6 +44,7 @@ from .models import (
     Project,
     ProjectAccess,
     Recording,
+    RecordingFormats,
     RecordingStates,
     RecordingTranscriptionStates,
     RecordingTypes,
@@ -1287,6 +1288,7 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
             data = {
                 "meeting_url": request.POST.get("meeting_url"),
                 "bot_name": request.POST.get("bot_name") or "Meeting Bot",
+                "recording_settings": {"format": RecordingFormats.MP3},
             }
             if meeting_type_from_url(data["meeting_url"]) == MeetingTypes.GOOGLE_MEET and BotLoginGroup.first_available_login(project=project, platform=BotLoginPlatform.GOOGLE_MEET):
                 data["google_meet_settings"] = {"use_login": True}
