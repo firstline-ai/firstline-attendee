@@ -5,6 +5,7 @@ import docker
 from celery import shared_task
 
 from bots.models import Bot
+from bots.tasks.bot_launch_guard import skip_terminal_bot_launch
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,12 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
     logger.info(f"Launching ephemeral Docker container for bot {bot_id}")
 
     try:
+        skipped = skip_terminal_bot_launch(bot_id)
+        if skipped:
+            return skipped
+
+        bot = Bot.objects.get(id=bot_id)
+
         # Connect to Docker daemon
         client = docker.from_env()
 
@@ -71,8 +78,6 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         cpu_quota = int(os.getenv("BOT_CPU_QUOTA", "100000"))  # 1 CPU default (100000 = 1 core)
         cpu_period = int(os.getenv("BOT_CPU_PERIOD", "100000"))
 
-        # Get bot to retrieve max_uptime_seconds (Bot.DoesNotExist propagates)
-        bot = Bot.objects.get(id=bot_id)
         automatic_leave_settings = bot.automatic_leave_settings()
         bot_max_uptime = automatic_leave_settings.get("max_uptime_seconds")
 

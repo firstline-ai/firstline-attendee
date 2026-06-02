@@ -14,6 +14,21 @@ services:
       - ENABLE_CHROME_SANDBOX=false
     command: "celery -A attendee worker -l INFO"
 
+  attendee-webhook-worker-local:
+    build: ./
+    volumes:
+      - .:/attendee
+    networks:
+      - attendee_network
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/5
+      - DJANGO_SETTINGS_MODULE=attendee.settings.development
+      - DELIVER_WEBHOOK_CELERY_QUEUE=webhooks
+    command: "celery -A attendee worker -l INFO -Q webhooks --concurrency=2"
+
   attendee-scheduler-local:
     build: ./
     volumes:

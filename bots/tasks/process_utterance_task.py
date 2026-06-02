@@ -16,6 +16,8 @@ from bots.webhook_utils import trigger_webhook
 
 PCM_BYTES_PER_SAMPLE = 2
 DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS = 25
+DEFAULT_CUSTOM_ASYNC_POLL_DELAY_SECONDS = 10
+DEFAULT_CUSTOM_ASYNC_MAX_STATUS_CHECKS = 120
 
 
 def transform_diarized_json_to_schema(result):
@@ -97,6 +99,22 @@ def process_utterance(self, utterance_id):
         transcription, failure_data = get_transcription(utterance)
 
         if failure_data:
+            if failure_data.get("reason") == TranscriptionFailureReasons.TRANSCRIPTION_IN_PROGRESS:
+                max_checks = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_MAX_STATUS_CHECKS", str(DEFAULT_CUSTOM_ASYNC_MAX_STATUS_CHECKS)))
+                if utterance.transcription_attempt_count < max_checks:
+                    utterance.save()
+                    countdown = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_POLL_DELAY_SECONDS", str(DEFAULT_CUSTOM_ASYNC_POLL_DELAY_SECONDS)))
+                    process_utterance.apply_async(args=[utterance_id], countdown=countdown)
+                    logger.info(f"Custom async transcription still in progress for utterance {utterance_id}; polling again in {countdown}s")
+                    return
+
+                failure_data = {
+                    "reason": TranscriptionFailureReasons.TIMED_OUT,
+                    "step": "custom_async_transcription_poll",
+                    "job_id": utterance.external_transcription_job_id,
+                    "attempts": utterance.transcription_attempt_count,
+                }
+
             if utterance.transcription_attempt_count < 5 and is_retryable_failure(failure_data):
                 utterance.save()
                 raise Exception(f"Retryable failure when transcribing utterance {utterance_id}: {failure_data}")
@@ -561,6 +579,142 @@ def combine_custom_async_transcriptions(transcriptions_with_offsets):
     return {"transcript": " ".join(transcript_parts).strip(), "words": words}
 
 
+def custom_async_submit_url(base_url):
+    override_url = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_SUBMIT_URL")
+    if override_url:
+        return override_url
+
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/api/transcriptions") or normalized.endswith("/transcriptions"):
+        return normalized
+    if normalized.endswith("/transcribe"):
+        return normalized[: -len("/transcribe")] + "/api/transcriptions"
+    return normalized + "/api/transcriptions"
+
+
+def custom_async_status_url(base_url, job_id):
+    template = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_STATUS_URL_TEMPLATE")
+    if template:
+        return template.format(job_id=job_id)
+    return f"{custom_async_submit_url(base_url).rstrip('/')}/{job_id}"
+
+
+def custom_async_result_to_transcription(result_data):
+    transcription = result_data.get("result", {}).get("transcription", "")
+    transcription["transcript"] = transcription["full_transcript"]
+    del transcription["full_transcript"]
+
+    # Extract all words from all utterances into a flat list
+    all_words = []
+    for utt in transcription["utterances"]:
+        if "words" in utt:
+            all_words.extend(utt["words"])
+    transcription["words"] = all_words
+    del transcription["utterances"]
+
+    return transcription
+
+
+def submit_custom_async_transcription_job(base_url, payload_mp3, data, timeout):
+    files = {"audio": ("audio.mp3", payload_mp3, "audio/mpeg")}
+    submit_url = custom_async_submit_url(base_url)
+
+    try:
+        logger.info(f"Submitting audio to custom async service at {submit_url}")
+        response = requests.post(submit_url, files=files, data=data if data else None, timeout=timeout)
+
+        if response.status_code == 401:
+            return None, None, {"reason": TranscriptionFailureReasons.CREDENTIALS_INVALID}
+
+        if response.status_code == 429:
+            return None, None, {"reason": TranscriptionFailureReasons.RATE_LIMIT_EXCEEDED, "status_code": response.status_code}
+
+        if response.status_code not in (200, 201, 202):
+            logger.error(f"Custom async transcription submit failed with status code {response.status_code}: {response.text}")
+            return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "status_code": response.status_code, "response_text": response.text}
+
+        result_data = response.json()
+        status = result_data.get("status")
+
+        if status == "done":
+            return custom_async_result_to_transcription(result_data), None, None
+
+        if status in ["queued", "processing"]:
+            job_id = result_data.get("job_id")
+            if not job_id:
+                return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_submit", "error": "missing job_id"}
+            return None, job_id, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_IN_PROGRESS, "job_id": job_id, "status": status}
+
+        if status == "error":
+            error_code = result_data.get("error_code")
+            return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_submit", "error_code": error_code}
+
+        return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_submit", "status": status}
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Custom async transcription submit timed out after {timeout} seconds")
+        return None, None, {"reason": TranscriptionFailureReasons.TIMED_OUT, "timeout": timeout}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Custom async transcription submit failed: {str(e)}")
+        return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": str(e)}
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Custom async transcription submit response parsing failed: {str(e)}")
+        return None, None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": f"Invalid JSON response: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Custom async transcription submit unexpected error: {str(e)}")
+        return None, None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e)}
+
+
+def poll_custom_async_transcription_job(base_url, job_id, timeout):
+    try:
+        status_url = custom_async_status_url(base_url, job_id)
+        logger.info(f"Polling custom async transcription job {job_id} at {status_url}")
+        response = requests.get(status_url, timeout=timeout)
+
+        if response.status_code == 401:
+            return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_INVALID}
+
+        if response.status_code == 429:
+            return None, {"reason": TranscriptionFailureReasons.RATE_LIMIT_EXCEEDED, "status_code": response.status_code}
+
+        if response.status_code != 200:
+            logger.error(f"Custom async transcription poll failed with status code {response.status_code}: {response.text}")
+            return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "status_code": response.status_code, "response_text": response.text}
+
+        result_data = response.json()
+        status = result_data.get("status")
+
+        if status == "completed" or status == "done":
+            return custom_async_result_to_transcription(result_data), None
+
+        if status in ["queued", "processing"]:
+            return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_IN_PROGRESS, "job_id": job_id, "status": status}
+
+        if status == "failed" or status == "error":
+            return None, {
+                "reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED,
+                "step": "transcribe_result_poll",
+                "job_id": job_id,
+                "error_code": result_data.get("error_code"),
+                "error_message": result_data.get("error_message"),
+            }
+
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_result_poll", "job_id": job_id, "status": status}
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Custom async transcription poll timed out after {timeout} seconds for job {job_id}")
+        return None, {"reason": TranscriptionFailureReasons.TIMED_OUT, "timeout": timeout, "job_id": job_id}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Custom async transcription poll failed: {str(e)}")
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": str(e), "job_id": job_id}
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"Custom async transcription poll response parsing failed: {str(e)}")
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": f"Invalid JSON response: {str(e)}", "job_id": job_id}
+    except Exception as e:
+        logger.error(f"Custom async transcription poll unexpected error: {str(e)}")
+        return None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e), "job_id": job_id}
+
+
 def transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout):
     files = {"audio": ("audio.mp3", payload_mp3, "audio/mpeg")}
 
@@ -640,23 +794,21 @@ def get_transcription_via_custom_async(utterance):
         else:
             data[key] = value
 
-    # Get timeout from environment or use default (120 retries like Gladia and AssemblyAI)
-    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "120"))  # 120 seconds default timeout
-    max_chunk_duration_seconds = int(os.getenv("CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS", str(DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS)))
+    # Keep request timeouts short; the Whisper service now owns the long-running work behind a job id.
+    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "30"))
+
+    if utterance.external_transcription_job_id:
+        return poll_custom_async_transcription_job(base_url, utterance.external_transcription_job_id, timeout)
 
     pcm_audio = utterance.get_audio_blob().tobytes()
     sample_rate = utterance.get_sample_rate()
-    chunks = custom_async_pcm_chunks(pcm_audio, sample_rate, max_chunk_duration_seconds)
+    payload_mp3 = pcm_to_mp3(pcm_audio, sample_rate=sample_rate)
+    transcription, job_id, failure_data = submit_custom_async_transcription_job(base_url, payload_mp3, data, timeout)
 
-    if len(chunks) > 1:
-        logger.info(f"Splitting custom async utterance {utterance.id} into {len(chunks)} chunks of up to {max_chunk_duration_seconds}s")
+    if job_id:
+        utterance.external_transcription_job_id = job_id
 
-    transcriptions_with_offsets = []
-    for offset_seconds, pcm_chunk in chunks:
-        payload_mp3 = pcm_to_mp3(pcm_chunk, sample_rate=sample_rate)
-        transcription, failure_data = transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout)
-        if failure_data:
-            return None, failure_data
-        transcriptions_with_offsets.append((offset_seconds, transcription))
+    if failure_data:
+        return None, failure_data
 
-    return combine_custom_async_transcriptions(transcriptions_with_offsets), None
+    return transcription, None
