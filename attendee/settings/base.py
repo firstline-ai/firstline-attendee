@@ -195,7 +195,7 @@ CELERY_TASK_ROUTES = {
         "queue": os.getenv("LAUNCH_SCHEDULED_BOT_CELERY_QUEUE", "celery"),
     },
     "bots.tasks.deliver_webhook_task.deliver_webhook": {
-        "queue": os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "celery"),
+        "queue": os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "webhooks"),
     },
 }
 

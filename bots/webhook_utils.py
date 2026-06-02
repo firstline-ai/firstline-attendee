@@ -3,12 +3,15 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import uuid
 from functools import partial
 
 from django.db import transaction
 
 logger = logging.getLogger(__name__)
+
+WEBHOOK_DELIVERY_QUEUE = os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "webhooks")
 
 
 def trigger_webhook(webhook_trigger_type, bot=None, calendar=None, zoom_oauth_connection=None, payload=None):
@@ -57,7 +60,7 @@ def trigger_webhook(webhook_trigger_type, bot=None, calendar=None, zoom_oauth_co
 
         from bots.tasks.deliver_webhook_task import deliver_webhook
 
-        transaction.on_commit(partial(deliver_webhook.delay, delivery_attempt.id))
+        transaction.on_commit(partial(deliver_webhook.apply_async, args=[delivery_attempt.id], queue=WEBHOOK_DELIVERY_QUEUE))
 
     return len(delivery_attempts)
 

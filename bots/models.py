@@ -2333,14 +2333,15 @@ class RecordingManager:
                 RecordingManager.set_recording_failed(recording)
 
         if recording.transcription_state == RecordingTranscriptionStates.IN_PROGRESS:
-            # We'll mark it as failed if there are any failed utterances or any in progress utterances
+            # Failed utterances are terminal. In-progress utterances may still be polling
+            # an async transcription provider, so keep post-processing open.
             any_in_progress_utterances = recording.utterances.filter(transcription__isnull=True, failure_data__isnull=True).exists()
             any_failed_utterances = recording.utterances.filter(failure_data__isnull=False).exists()
-            if any_failed_utterances or any_in_progress_utterances:
+            if any_failed_utterances:
                 failure_reasons = list(recording.utterances.filter(failure_data__has_key="reason").values_list("failure_data__reason", flat=True).distinct())
-                if any_in_progress_utterances:
-                    failure_reasons.append(TranscriptionFailureReasons.UTTERANCES_STILL_IN_PROGRESS_WHEN_RECORDING_TERMINATED)
                 RecordingManager.set_recording_transcription_failed(recording, failure_data={"failure_reasons": failure_reasons})
+            elif any_in_progress_utterances:
+                return
             else:
                 RecordingManager.set_recording_transcription_complete(recording)
 
@@ -2467,6 +2468,7 @@ class TranscriptionFailureReasons(models.TextChoices):
     TRANSCRIPTION_REQUEST_FAILED = "transcription_request_failed"
     TIMED_OUT = "timed_out"
     INTERNAL_ERROR = "internal_error"
+    TRANSCRIPTION_IN_PROGRESS = "transcription_in_progress"
     # This reason applies to the transcription operation as a whole, not a specific utterance
     UTTERANCES_STILL_IN_PROGRESS_WHEN_RECORDING_TERMINATED = "utterances_still_in_progress_when_recording_terminated"
     UTTERANCES_STILL_IN_PROGRESS_WHEN_TRANSCRIPTION_TERMINATED = "utterances_still_in_progress_when_transcription_terminated"
@@ -2662,6 +2664,7 @@ class Utterance(models.Model):
     transcription = models.JSONField(null=True, default=None)
     # To keep track of how many retries we've done for this utterance
     transcription_attempt_count = models.IntegerField(default=0)
+    external_transcription_job_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
     failure_data = models.JSONField(null=True, default=None)
     source_uuid = models.CharField(max_length=255, null=True, unique=True)
 

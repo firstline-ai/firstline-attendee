@@ -553,10 +553,10 @@ class WebhookDeliveryTest(TransactionTestCase):
 
         # After the transaction commits, on_commit callbacks should have fired
         self.assertEqual(WebhookDeliveryAttempt.objects.count(), 2)
-        self.assertEqual(mock_deliver.delay.call_count, 2)
+        self.assertEqual(mock_deliver.apply_async.call_count, 2)
 
-        # IDs that were actually passed to deliver_webhook.delay(...)
-        attempt_ids_called = [call.args[0] for call in mock_deliver.delay.call_args_list]
+        # IDs that were actually passed to deliver_webhook.apply_async(...)
+        attempt_ids_called = [call.kwargs["args"][0] for call in mock_deliver.apply_async.call_args_list]
 
         # IDs of the delivery attempts we created
         attempt_ids_in_db = list(WebhookDeliveryAttempt.objects.values_list("id", flat=True))
@@ -564,6 +564,27 @@ class WebhookDeliveryTest(TransactionTestCase):
         # With correct code, the sets match (two distinct IDs).
         # With the buggy lambda, attempt_ids_called will contain the same ID twice.
         self.assertEqual(set(attempt_ids_called), set(attempt_ids_in_db))
+
+    @patch("bots.tasks.deliver_webhook_task.deliver_webhook")
+    def test_trigger_webhook_enqueues_delivery_on_webhooks_queue(self, mock_deliver):
+        from bots.webhook_utils import trigger_webhook
+
+        WebhookSubscription.objects.all().delete()
+        WebhookSubscription.objects.create(
+            project=self.project,
+            url="https://example.com/webhook1",
+            triggers=[WebhookTriggerTypes.BOT_STATE_CHANGE],
+        )
+
+        with transaction.atomic():
+            trigger_webhook(
+                webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE,
+                bot=self.bot,
+                payload={"test": "webhook_queue"},
+            )
+
+        delivery_attempt = WebhookDeliveryAttempt.objects.get()
+        mock_deliver.apply_async.assert_called_once_with(args=[delivery_attempt.id], queue="webhooks")
 
 
 class IsGlobalWebhookRateLimitReachedTest(TransactionTestCase):

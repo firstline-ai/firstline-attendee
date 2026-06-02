@@ -1,3 +1,4 @@
+import os
 import uuid
 from unittest import mock
 
@@ -11,9 +12,11 @@ from bots.models import (
     Participant,
     Project,
     Recording,
+    RecordingManager,
     RecordingStates,
     RecordingTranscriptionStates,
     TranscriptionFailureReasons,
+    TranscriptionProviders,
     Utterance,
 )
 from bots.tasks.process_utterance_task import get_transcription_via_assemblyai, get_transcription_via_custom_async, get_transcription_via_deepgram, get_transcription_via_elevenlabs, get_transcription_via_gladia, get_transcription_via_openai, get_transcription_via_sarvam, process_utterance
@@ -98,6 +101,55 @@ class ProcessUtteranceTaskTest(TransactionTestCase):
         self.utterance.refresh_from_db()
         self.assertEqual(self.utterance.transcription_attempt_count, 1)
         self.assertIsNone(self.utterance.failure_data)
+
+    def test_terminate_recording_preserves_in_progress_transcription_until_utterances_finish(self):
+        RecordingManager.terminate_recording(self.recording)
+
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+        self.assertEqual(self.recording.transcription_state, RecordingTranscriptionStates.IN_PROGRESS)
+        self.assertIsNone(self.recording.transcription_failure_data)
+
+    @mock.patch.dict(os.environ, {"CUSTOM_ASYNC_TRANSCRIPTION_URL": "http://whisper/transcribe", "CUSTOM_ASYNC_TRANSCRIPTION_POLL_DELAY_SECONDS": "7"})
+    @mock.patch("bots.tasks.process_utterance_task.process_utterance.apply_async")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3-bytes")
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    def test_custom_async_submit_saves_job_id_and_requeues_without_failure(self, mock_post, mock_pcm_to_mp3, mock_apply_async):
+        self.recording.transcription_provider = TranscriptionProviders.CUSTOM_ASYNC
+        self.recording.save()
+        mock_post.return_value = mock.Mock(status_code=202, json=lambda: {"job_id": "job_123", "status": "queued"})
+
+        self._run_task()
+
+        self.utterance.refresh_from_db()
+        self.assertEqual(self.utterance.external_transcription_job_id, "job_123")
+        self.assertIsNone(self.utterance.failure_data)
+        self.assertIsNone(self.utterance.transcription)
+        mock_apply_async.assert_called_once_with(args=[self.utterance.id], countdown=7)
+
+    @mock.patch.dict(os.environ, {"CUSTOM_ASYNC_TRANSCRIPTION_URL": "http://whisper/transcribe"})
+    @mock.patch("bots.tasks.process_utterance_task.requests.get")
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    def test_custom_async_poll_completed_job_saves_transcription(self, mock_post, mock_get):
+        self.recording.transcription_provider = TranscriptionProviders.CUSTOM_ASYNC
+        self.recording.save()
+        self.utterance.external_transcription_job_id = "job_123"
+        self.utterance.save()
+        mock_get.return_value = mock.Mock(
+            status_code=200,
+            json=lambda: {
+                "job_id": "job_123",
+                "status": "completed",
+                "result": {"transcription": {"full_transcript": "olá mundo", "utterances": [{"words": []}]}},
+            },
+        )
+
+        self._run_task()
+
+        self.utterance.refresh_from_db()
+        self.assertEqual(self.utterance.transcription["transcript"], "olá mundo")
+        self.assertIsNone(self.utterance.failure_data)
+        mock_post.assert_not_called()
 
 
 class BotModelRedactionSettingsTest(TransactionTestCase):
