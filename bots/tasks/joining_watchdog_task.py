@@ -2,6 +2,7 @@ import logging
 
 from celery import shared_task
 
+from bots.ephemeral_container_utils import terminate_ephemeral_docker_container
 from bots.models import (
     Bot,
     BotEventManager,
@@ -50,3 +51,6 @@ def kill_stuck_joining_bot(self, bot_id):
         logger.error(
             f"Joining watchdog: falha ao criar FATAL_ERROR para bot {bot_id}: {e}"
         )
+        return
+
+    terminate_ephemeral_docker_container(bot)
