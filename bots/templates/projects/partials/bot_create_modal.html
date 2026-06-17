@@ -42,7 +42,10 @@
   --header 'Content-Type: application/json' \
   --data '{
     "meeting_url": "https://zoom.us/j/123?pwd=456",
-    "bot_name": "My Bot"
+    "bot_name": "My Bot",
+    "recording_settings": {
+      "format": "mp3"
+    }
   }'</code></pre>
                         </div>
                     </div>
@@ -146,7 +149,10 @@
                     `  --header 'Content-Type: application/json' \\`,
                     `  --data '{`,
                     `    "meeting_url": "${meetingUrl}",`,
-                    `    "bot_name": "${botName}"`,
+                    `    "bot_name": "${botName}",`,
+                    `    "recording_settings": {`,
+                    `      "format": "mp3"`,
+                    `    }`,
                     `  }'`
                 ];
                 

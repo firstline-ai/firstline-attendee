@@ -81,6 +81,15 @@ class TestCreateBot(TestCase):
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNone(error)
 
+    @patch.dict("os.environ", {"CUSTOM_ASYNC_TRANSCRIPTION_URL": "https://whisper.example.com/transcribe"})
+    def test_google_meet_defaults_to_custom_async_pt_br_when_configured(self):
+        bot, error = create_bot(data={"meeting_url": "https://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, source=BotCreationSource.API, project=self.project)
+
+        self.assertIsNotNone(bot)
+        self.assertIsNone(error)
+        self.assertEqual(bot.settings["transcription_settings"], {"custom_async": {"language": "pt-BR"}})
+        self.assertEqual(bot.recordings.first().transcription_provider, TranscriptionProviders.CUSTOM_ASYNC)
+
     def test_create_zoom_bot_with_default_settings(self):
         ZoomOAuthApp.objects.create(project=self.project, client_id="123")
         bot, error = create_bot(data={"meeting_url": "https://zoom.us/j/123456789", "bot_name": "Test Bot"}, source=BotCreationSource.API, project=self.project)

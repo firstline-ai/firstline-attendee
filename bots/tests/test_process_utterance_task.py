@@ -1835,6 +1835,50 @@ class CustomAsyncProviderTest(TransactionTestCase):
 
             self.assertEqual(data["nested_param"], json.dumps({"key": "value", "list": [1, 2, 3]}))
 
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3")
+    def test_long_audio_is_split_before_custom_async_request(self, mock_pcm, mock_post):
+        """Long custom async utterances are split so each Whisper request stays below proxy timeouts."""
+        self.bot.settings = {"transcription_settings": {"custom_async": {"language": "pt-BR"}}}
+        self.bot.save()
+        self.audio_chunk.audio_blob = b"a" * 60
+        self.audio_chunk.sample_rate = 10
+        self.audio_chunk.duration_ms = 3000
+        self.audio_chunk.save()
+        self.utterance.duration_ms = 3000
+        self.utterance.save()
+
+        mock_pcm.side_effect = [b"mp3-1", b"mp3-2", b"mp3-3"]
+        responses = []
+        for transcript, word_start, word_end in [
+            ("primeiro", 0.1, 0.5),
+            ("segundo", 0.2, 0.4),
+            ("terceiro", 0.0, 0.3),
+        ]:
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {
+                "status": "done",
+                "result": {
+                    "transcription": {
+                        "full_transcript": transcript,
+                        "utterances": [{"words": [{"word": transcript, "start": word_start, "end": word_end}]}],
+                    }
+                },
+            }
+            responses.append(response)
+        mock_post.side_effect = responses
+
+        with self._patch_env(), mock.patch.dict("os.environ", {"CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS": "1"}):
+            transcript, failure = get_transcription_via_custom_async(self.utterance)
+
+        self.assertIsNone(failure)
+        self.assertEqual(transcript["transcript"], "primeiro segundo terceiro")
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual([call.kwargs["files"]["audio"][1] for call in mock_post.call_args_list], [b"mp3-1", b"mp3-2", b"mp3-3"])
+        self.assertEqual(transcript["words"][0], {"word": "primeiro", "start": 0.1, "end": 0.5})
+        self.assertEqual(transcript["words"][1], {"word": "segundo", "start": 1.2, "end": 1.4})
+        self.assertEqual(transcript["words"][2], {"word": "terceiro", "start": 2.0, "end": 2.3})
+
     def test_missing_env_url(self):
         """No CUSTOM_ASYNC_TRANSCRIPTION_URL env var → CREDENTIALS_NOT_FOUND."""
         with mock.patch.dict("os.environ", {}, clear=True):

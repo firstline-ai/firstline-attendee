@@ -14,6 +14,9 @@ from bots.utils import pcm_to_mp3
 from bots.webhook_payloads import utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
 
+PCM_BYTES_PER_SAMPLE = 2
+DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS = 25
+
 
 def transform_diarized_json_to_schema(result):
     """
@@ -523,31 +526,43 @@ def get_transcription_via_elevenlabs(utterance):
         return None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e)}
 
 
-def get_transcription_via_custom_async(utterance):
-    transcription_settings = utterance.transcription_settings
+def custom_async_pcm_chunks(pcm_audio, sample_rate, max_chunk_duration_seconds):
+    bytes_per_second = sample_rate * PCM_BYTES_PER_SAMPLE
+    max_chunk_bytes = bytes_per_second * max_chunk_duration_seconds
+    max_chunk_bytes -= max_chunk_bytes % PCM_BYTES_PER_SAMPLE
 
-    # Get the base URL from environment variable
-    base_url = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_URL")
-    if not base_url:
-        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND, "error": "CUSTOM_ASYNC_TRANSCRIPTION_URL environment variable not set"}
+    if max_chunk_bytes <= 0 or len(pcm_audio) <= max_chunk_bytes:
+        return [(0.0, pcm_audio)]
 
-    # Get additional properties from settings
-    additional_props = transcription_settings.custom_async_additional_props()
+    chunks = []
+    for start_byte in range(0, len(pcm_audio), max_chunk_bytes):
+        offset_seconds = start_byte / bytes_per_second
+        chunks.append((offset_seconds, pcm_audio[start_byte : start_byte + max_chunk_bytes]))
+    return chunks
 
-    payload_mp3 = pcm_to_mp3(utterance.get_audio_blob().tobytes(), sample_rate=utterance.get_sample_rate())
 
+def combine_custom_async_transcriptions(transcriptions_with_offsets):
+    transcript_parts = []
+    words = []
+
+    for offset_seconds, transcription in transcriptions_with_offsets:
+        transcript = transcription.get("transcript")
+        if transcript:
+            transcript_parts.append(transcript)
+
+        for word in transcription.get("words", []):
+            adjusted_word = word.copy()
+            if "start" in adjusted_word:
+                adjusted_word["start"] = round(float(adjusted_word["start"]) + offset_seconds, 3)
+            if "end" in adjusted_word:
+                adjusted_word["end"] = round(float(adjusted_word["end"]) + offset_seconds, 3)
+            words.append(adjusted_word)
+
+    return {"transcript": " ".join(transcript_parts).strip(), "words": words}
+
+
+def transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout):
     files = {"audio": ("audio.mp3", payload_mp3, "audio/mpeg")}
-
-    # Add additional properties as form data
-    data = {}
-    for key, value in additional_props.items():
-        if isinstance(value, (dict, list)):
-            data[key] = json.dumps(value)
-        else:
-            data[key] = value
-
-    # Get timeout from environment or use default (120 retries like Gladia and AssemblyAI)
-    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "120"))  # 120 seconds default timeout
 
     try:
         # Make the POST request to the custom transcription service
@@ -604,3 +619,44 @@ def get_transcription_via_custom_async(utterance):
     except Exception as e:
         logger.error(f"Custom async transcription unexpected error: {str(e)}")
         return None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e)}
+
+
+def get_transcription_via_custom_async(utterance):
+    transcription_settings = utterance.transcription_settings
+
+    # Get the base URL from environment variable
+    base_url = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_URL")
+    if not base_url:
+        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND, "error": "CUSTOM_ASYNC_TRANSCRIPTION_URL environment variable not set"}
+
+    # Get additional properties from settings
+    additional_props = transcription_settings.custom_async_additional_props()
+
+    # Add additional properties as form data
+    data = {}
+    for key, value in additional_props.items():
+        if isinstance(value, (dict, list)):
+            data[key] = json.dumps(value)
+        else:
+            data[key] = value
+
+    # Get timeout from environment or use default (120 retries like Gladia and AssemblyAI)
+    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "120"))  # 120 seconds default timeout
+    max_chunk_duration_seconds = int(os.getenv("CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS", str(DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS)))
+
+    pcm_audio = utterance.get_audio_blob().tobytes()
+    sample_rate = utterance.get_sample_rate()
+    chunks = custom_async_pcm_chunks(pcm_audio, sample_rate, max_chunk_duration_seconds)
+
+    if len(chunks) > 1:
+        logger.info(f"Splitting custom async utterance {utterance.id} into {len(chunks)} chunks of up to {max_chunk_duration_seconds}s")
+
+    transcriptions_with_offsets = []
+    for offset_seconds, pcm_chunk in chunks:
+        payload_mp3 = pcm_to_mp3(pcm_chunk, sample_rate=sample_rate)
+        transcription, failure_data = transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout)
+        if failure_data:
+            return None, failure_data
+        transcriptions_with_offsets.append((offset_seconds, transcription))
+
+    return combine_custom_async_transcriptions(transcriptions_with_offsets), None
