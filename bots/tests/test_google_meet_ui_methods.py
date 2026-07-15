@@ -47,12 +47,14 @@ class TestGoogleMeetUIMethods(TestCase):
         mock_set_layout,
     ):
         adapter = MinimalGoogleMeetAdapter()
+        adapter.disable_incoming_video = True
         adapter.wait_until_admitted_to_meeting_without_captions = MagicMock(return_value=None)
 
         adapter.attempt_to_join_meeting()
 
         mock_click_captions_button.assert_not_called()
         adapter.wait_until_admitted_to_meeting_without_captions.assert_called_once()
+        mock_set_layout.assert_not_called()
 
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.ready_to_show_bot_image", create=True, return_value=None)
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.set_layout", return_value=None)
@@ -85,6 +87,7 @@ class TestGoogleMeetUIMethods(TestCase):
 
         mock_click_captions_button.assert_called_once()
         adapter.wait_until_admitted_to_meeting_without_captions.assert_not_called()
+        mock_set_layout.assert_called_once_with(None)
 
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.WebDriverWait")
     def test_wait_until_admitted_without_captions_returns_when_leave_button_is_available(self, MockWebDriverWait):

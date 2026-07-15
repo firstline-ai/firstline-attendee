@@ -940,7 +940,14 @@ class GoogleMeetUIMethods:
 
         self.wait_for_host_if_needed()
 
-        self.set_layout(layout_to_select)
+        # Audio-only bots do not consume incoming video, so the Meet layout has no
+        # effect on their output.  Treating this cosmetic UI action as mandatory
+        # makes an audio transcription bot fail when Google changes the layout
+        # menu, before it can capture any audio.
+        if not self.disable_incoming_video:
+            self.set_layout(layout_to_select)
+        else:
+            logger.info("Skipping Meet layout selection because incoming video is disabled")
 
         if self.disable_incoming_video:
             self.disable_incoming_video_in_ui()
