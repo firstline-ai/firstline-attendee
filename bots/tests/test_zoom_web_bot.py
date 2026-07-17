@@ -873,6 +873,11 @@ class TestZoomWebBot(TransactionTestCase):
         adapter.handle_participant_update(bot_participant)
         adapter.update_only_one_participant_in_meeting_at()
 
+        # A bot that joins an already-empty meeting must also start the
+        # only-participant timer; otherwise it can remain there until the
+        # much longer silence timeout expires.
+        self.assertIsNotNone(adapter.only_one_participant_in_meeting_at, "Timer should start when the bot is alone")
+
         # Step 1: Real participant joins Notetakerz should NOT be counted as a bot
         real_participant = {
             "deviceId": "real_user_device",
