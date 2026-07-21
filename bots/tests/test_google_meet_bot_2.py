@@ -24,6 +24,7 @@ from bots.models import (
     BotStates,
     ChatMessage,
     Credentials,
+    ExternalMediaUploadStates,
     Organization,
     Participant,
     ParticipantEvent,
@@ -1378,8 +1379,10 @@ class TestGoogleMeetBot2(TransactionTestCase):
     @patch("bots.bot_controller.bot_controller.S3FileUploader")
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.check_if_meeting_is_found", return_value=None)
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.wait_for_host_if_needed", return_value=None)
+    @patch("bots.tasks.external_media_recording_upload_task.enqueue_external_media_recording_upload")
     def test_bot_uploads_to_external_storage_when_credentials_available(
         self,
+        mock_enqueue_external_media_upload,
         mock_wait_for_host_if_needed,
         mock_check_if_meeting_is_found,
         MockS3FileUploader,
@@ -1401,7 +1404,8 @@ class TestGoogleMeetBot2(TransactionTestCase):
         external_credentials = Credentials.objects.create(project=self.project, credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE)
         external_credentials.set_credentials({"access_key_id": "test_access_key", "access_key_secret": "test_secret_key", "endpoint_url": "https://s3.amazonaws.com", "region_name": "us-east-1"})
 
-        # Configure the mock uploader for both regular and external storage
+        # Configure the primary Attendee storage uploader. The customer bucket
+        # is delivered by a separate retryable task after primary persistence.
         mock_azure_uploader = create_mock_file_uploader()
         MockAzureFileUploader.return_value = mock_azure_uploader
         mock_s3_uploader = create_mock_file_uploader()
@@ -1456,33 +1460,22 @@ class TestGoogleMeetBot2(TransactionTestCase):
         self.recording.refresh_from_db()
         self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
 
-        # Verify file uploader was called multiple times - once for external storage and once for regular storage
-        # The external storage upload happens first, then the regular upload
-        self.assertEqual(mock_azure_uploader.upload_file.call_count, 1, "FileUploader.upload_file should be called twice - once for external storage and once for regular storage")
-        self.assertEqual(mock_s3_uploader.upload_file.call_count, 1, "FileUploader.upload_file should be called twice - once for external storage and once for regular storage")
+        # The primary recording must finish before the durable external-media
+        # task is queued; direct best-effort uploads are intentionally absent.
+        self.assertEqual(mock_azure_uploader.upload_file.call_count, 1)
+        self.assertEqual(mock_azure_uploader.wait_for_upload.call_count, 1)
+        self.assertEqual(MockAzureFileUploader.call_count, 1)
+        MockS3FileUploader.assert_not_called()
 
-        self.assertEqual(mock_azure_uploader.wait_for_upload.call_count, 1, "FileUploader.wait_for_upload should be called twice")
-        self.assertEqual(mock_s3_uploader.wait_for_upload.call_count, 1, "FileUploader.wait_for_upload should be called twice")
-
-        # Verify FileUploader was instantiated twice with different parameters
-        self.assertEqual(MockAzureFileUploader.call_count, 1, "FileUploader should be instantiated twice")
-        self.assertEqual(MockS3FileUploader.call_count, 1, "FileUploader should be instantiated twice")
-
-        # Check the first call (external storage)
-        external_call_args = MockS3FileUploader.call_args_list[0]
-        external_call_kwargs = external_call_args.kwargs
-        self.assertEqual(external_call_kwargs["bucket"], "my-external-bucket")
-        self.assertEqual(external_call_kwargs["filename"], "custom-recording-name.mp4")
-        self.assertEqual(external_call_kwargs["endpoint_url"], "https://s3.amazonaws.com")
-        self.assertEqual(external_call_kwargs["region_name"], "us-east-1")
-        self.assertEqual(external_call_kwargs["access_key_id"], "test_access_key")
-        self.assertEqual(external_call_kwargs["access_key_secret"], "test_secret_key")
-
-        # Check the second call (regular storage) - should use environment variables
+        # Check the primary storage call - should use environment variables.
         regular_call_args = MockAzureFileUploader.call_args_list[0]
         regular_call_kwargs = regular_call_args.kwargs
         self.assertEqual(regular_call_kwargs["container"], "test-container")  # From environment variable set in setUpClass
         self.assertIsNotNone(regular_call_kwargs["filename"])  # Should have some recording filename
+
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.external_media_upload_state, ExternalMediaUploadStates.PENDING)
+        mock_enqueue_external_media_upload.assert_called_once_with(self.recording.id)
 
         # Verify only one delete_file call (for the regular storage uploader)
         mock_azure_uploader.delete_file.assert_called_once()

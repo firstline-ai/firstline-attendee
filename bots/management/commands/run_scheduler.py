@@ -14,9 +14,29 @@ from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import (
+    Bot,
+    BotStates,
+    Calendar,
+    CalendarStates,
+    ExternalMediaUploadStates,
+    Recording,
+    Utterance,
+    WebhookDeliveryAttempt,
+    WebhookDeliveryAttemptStatus,
+    WebhookTriggerTypes,
+    ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
+)
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
+from bots.tasks.deliver_webhook_task import (
+    POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS,
+    POST_PROCESSING_WEBHOOK_REENQUEUE_SECONDS,
+    enqueue_post_processing_webhook_delivery,
+)
+from bots.tasks.external_media_recording_upload_task import enqueue_external_media_recording_upload
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
+from bots.tasks.process_utterance_task import TRANSCRIPTION_CLAIM_STALE_SECONDS, process_utterance
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
 from bots.tasks.sync_calendar_task import enqueue_sync_calendar_task
 from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_connection_task
@@ -24,6 +44,8 @@ from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_c
 log = logging.getLogger(__name__)
 
 CALENDAR_SYNC_THRESHOLD_HOURS = 24  # The longest a calendar can go without having been synced
+EXTERNAL_MEDIA_UPLOAD_REENQUEUE_SECONDS = int(os.getenv("EXTERNAL_MEDIA_UPLOAD_REENQUEUE_SECONDS", 300))
+EXTERNAL_MEDIA_UPLOAD_STALE_SECONDS = int(os.getenv("EXTERNAL_MEDIA_UPLOAD_STALE_SECONDS", 900))
 
 
 class Command(BaseCommand):
@@ -86,6 +108,9 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
+                self._run_pending_external_media_uploads()
+                self._run_stale_transcription_claims()
+                self._run_pending_post_processing_webhooks()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
@@ -291,3 +316,79 @@ class Command(BaseCommand):
             enqueue_autopay_charge_task(organization)
 
         log.info("Enqueued %d autopay tasks", len(organizations))
+
+    def _run_pending_external_media_uploads(self):
+        """Re-enqueue persisted R2/S3 deliveries that were interrupted or delayed."""
+        now = timezone.now()
+        enqueue_cutoff = now - timezone.timedelta(seconds=EXTERNAL_MEDIA_UPLOAD_REENQUEUE_SECONDS)
+        stale_cutoff = now - timezone.timedelta(seconds=EXTERNAL_MEDIA_UPLOAD_STALE_SECONDS)
+        candidates = (
+            Recording.objects.filter(file__isnull=False)
+            .exclude(file="")
+            .filter(
+                Q(
+                    external_media_upload_state=ExternalMediaUploadStates.PENDING,
+                )
+                & (
+                    Q(external_media_upload_enqueued_at__isnull=True)
+                    | Q(external_media_upload_enqueued_at__lte=enqueue_cutoff)
+                )
+                | Q(
+                    external_media_upload_state=ExternalMediaUploadStates.UPLOADING,
+                    external_media_upload_started_at__lte=stale_cutoff,
+                )
+            )
+            .select_related("bot")
+            .order_by("updated_at")[:100]
+        )
+
+        enqueued = 0
+        for recording in candidates:
+            if not recording.bot.external_media_storage_bucket_name():
+                continue
+            if enqueue_external_media_recording_upload(recording.id):
+                enqueued += 1
+        log.info("Re-enqueued %d pending external-media recording upload(s)", enqueued)
+
+    def _run_stale_transcription_claims(self):
+        """Recover an utterance whose worker died after claiming its audio."""
+        stale_cutoff = timezone.now() - timezone.timedelta(seconds=TRANSCRIPTION_CLAIM_STALE_SECONDS)
+        stale_utterances = (
+            Utterance.objects.filter(
+                transcription__isnull=True,
+                failure_data__isnull=True,
+                transcription_processing_task_id__isnull=False,
+                transcription_processing_started_at__lte=stale_cutoff,
+            )
+            .order_by("transcription_processing_started_at")[:100]
+        )
+        for utterance in stale_utterances:
+            process_utterance.delay(utterance.id)
+        log.info("Re-enqueued %d stale transcription claim(s)", len(stale_utterances))
+
+    def _run_pending_post_processing_webhooks(self):
+        """Recover the persisted ``ended`` webhook that starts FirstLine analysis."""
+        cutoff = timezone.now() - timezone.timedelta(seconds=POST_PROCESSING_WEBHOOK_REENQUEUE_SECONDS)
+        pending_deliveries = (
+            WebhookDeliveryAttempt.objects.filter(
+                webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE,
+                payload__new_state="ended",
+                attempt_count__lt=POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS,
+            )
+            .filter(
+                Q(
+                    status=WebhookDeliveryAttemptStatus.FAILURE,
+                    last_attempt_at__lte=cutoff,
+                )
+                | Q(
+                    status=WebhookDeliveryAttemptStatus.PENDING,
+                )
+                & (Q(last_attempt_at__isnull=True) | Q(last_attempt_at__lte=cutoff))
+            )
+            .order_by("last_attempt_at", "created_at")[:100]
+        )
+        requeued = 0
+        for delivery in pending_deliveries:
+            if enqueue_post_processing_webhook_delivery(delivery.id):
+                requeued += 1
+        log.info("Re-enqueued %d pending post-processing webhook(s)", requeued)

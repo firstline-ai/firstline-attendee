@@ -5,8 +5,12 @@ import time
 
 import requests
 from celery import shared_task
+from django.db.models import Q
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+TRANSCRIPTION_CLAIM_STALE_SECONDS = int(os.getenv("TRANSCRIPTION_CLAIM_STALE_SECONDS", 900))
 
 from bots.models import Credentials, RecordingManager, TranscriptionFailureReasons, TranscriptionProviders, Utterance, WebhookTriggerTypes
 from bots.transcription_utils import get_transcription_via_assemblyai_from_mp3, is_retryable_failure
@@ -79,7 +83,29 @@ def get_transcription(utterance):
     max_retries=6,
 )
 def process_utterance(self, utterance_id):
-    utterance = Utterance.objects.get(id=utterance_id)
+    task_id = str(self.request.id or f"inline-{utterance_id}")
+    stale_cutoff = timezone.now() - timezone.timedelta(seconds=TRANSCRIPTION_CLAIM_STALE_SECONDS)
+    claimed = (
+        Utterance.objects.filter(
+            id=utterance_id,
+            transcription__isnull=True,
+            failure_data__isnull=True,
+        )
+        .filter(
+            Q(transcription_processing_task_id__isnull=True)
+            | Q(transcription_processing_task_id=task_id)
+            | Q(transcription_processing_started_at__lte=stale_cutoff)
+        )
+        .update(
+            transcription_processing_task_id=task_id,
+            transcription_processing_started_at=timezone.now(),
+        )
+    )
+    if not claimed:
+        logger.info("Utterance %s já possui uma transcrição ou um claim ativo", utterance_id)
+        return
+
+    utterance = Utterance.objects.select_related("recording__bot", "audio_chunk").get(id=utterance_id)
     logger.info(f"Processing utterance {utterance_id}")
 
     recording = utterance.recording
@@ -114,6 +140,8 @@ def process_utterance(self, utterance_id):
             utterance.audio_chunk.clear_audio_data()
 
         utterance.transcription = transcription
+        utterance.transcription_processing_task_id = None
+        utterance.transcription_processing_started_at = None
         utterance.save()
 
         logger.info(f"Transcription complete for utterance {utterance_id}")

@@ -12,6 +12,7 @@ import gi
 import redis
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.utils import timezone
 
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
@@ -42,6 +43,7 @@ from bots.models import (
     ChatMessage,
     ChatMessageToOptions,
     Credentials,
+    ExternalMediaUploadStates,
     MeetingTypes,
     Participant,
     ParticipantEvent,
@@ -511,7 +513,24 @@ class BotController:
         recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
         recording.file = s3_storage_key
         recording.first_buffer_timestamp_ms = self.get_first_buffer_timestamp_ms()
-        recording.save()
+        update_fields = ["file", "first_buffer_timestamp_ms", "updated_at"]
+        if self.bot_in_db.external_media_storage_bucket_name():
+            recording.external_media_upload_state = ExternalMediaUploadStates.PENDING
+            recording.external_media_upload_requested_at = timezone.now()
+            recording.external_media_upload_failure_data = None
+            update_fields.extend(
+                [
+                    "external_media_upload_state",
+                    "external_media_upload_requested_at",
+                    "external_media_upload_failure_data",
+                ]
+            )
+        recording.save(update_fields=update_fields)
+
+        if self.bot_in_db.external_media_storage_bucket_name():
+            from bots.tasks.external_media_recording_upload_task import enqueue_external_media_recording_upload
+
+            transaction.on_commit(lambda recording_id=recording.id: enqueue_external_media_recording_upload(recording_id))
 
     def get_recording_transcription_provider(self):
         recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
@@ -543,36 +562,6 @@ class BotController:
         else:
             raise Exception("No rtmp client found")
 
-    def upload_recording_to_external_media_storage_if_enabled(self):
-        if not self.bot_in_db.external_media_storage_bucket_name():
-            return
-
-        external_media_storage_credentials_record = self.bot_in_db.project.credentials.filter(credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE).first()
-        if not external_media_storage_credentials_record:
-            logger.error(f"No external media storage credentials found for bot {self.bot_in_db.id}")
-            return
-
-        external_media_storage_credentials = external_media_storage_credentials_record.get_credentials()
-        if not external_media_storage_credentials:
-            logger.error(f"External media storage credentials data not found for bot {self.bot_in_db.id}")
-            return
-
-        try:
-            logger.info(f"Uploading recording to external media storage bucket {self.bot_in_db.external_media_storage_bucket_name()}")
-            file_uploader = S3FileUploader(
-                bucket=self.bot_in_db.external_media_storage_bucket_name(),
-                filename=self.bot_in_db.external_media_storage_recording_file_name() or self.get_recording_filename(),
-                endpoint_url=external_media_storage_credentials.get("endpoint_url") or None,
-                region_name=external_media_storage_credentials.get("region_name"),
-                access_key_id=external_media_storage_credentials.get("access_key_id"),
-                access_key_secret=external_media_storage_credentials.get("access_key_secret"),
-            )
-            file_uploader.upload_file(self.get_recording_file_location())
-            file_uploader.wait_for_upload()
-            logger.info(f"File uploader finished uploading file to external media storage bucket {self.bot_in_db.external_media_storage_bucket_name()}")
-        except Exception as e:
-            logger.exception(f"Error uploading recording to external media storage bucket {self.bot_in_db.external_media_storage_bucket_name()}: {e}")
-
     def get_file_uploader(self):
         if settings.STORAGE_PROTOCOL == "azure":
             return AzureFileUploader(
@@ -581,12 +570,18 @@ class BotController:
                 connection_string=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("connection_string"),
                 account_key=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_key"),
                 account_name=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_name"),
+                max_attempts=3,
+                initial_retry_delay_seconds=1,
+                verify_upload=True,
             )
 
         return S3FileUploader(
             bucket=settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
             filename=self.get_recording_filename(),
             endpoint_url=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("endpoint_url"),
+            max_attempts=3,
+            initial_retry_delay_seconds=1,
+            verify_upload=True,
         )
 
     def cleanup(self):
@@ -645,12 +640,10 @@ class BotController:
             self.websocket_client_manager.cleanup()
 
         if self.get_recording_file_location():
-            self.upload_recording_to_external_media_storage_if_enabled()
-
             logger.info("Telling file uploader to upload recording file...")
             file_uploader = self.get_file_uploader()
             file_uploader.upload_file(self.get_recording_file_location())
-            file_uploader.wait_for_upload()
+            file_uploader.wait_for_upload(raise_on_error=True)
             logger.info("File uploader finished uploading file")
             file_uploader.delete_file(self.get_recording_file_location())
             logger.info("File uploader deleted file from local filesystem")

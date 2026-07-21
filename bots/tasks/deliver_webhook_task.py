@@ -6,6 +6,7 @@ import redis
 import requests
 from celery import shared_task
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from bots.models import SessionTypes, WebhookDeliveryAttempt, WebhookDeliveryAttemptStatus, WebhookTriggerTypes
@@ -38,10 +39,57 @@ def is_global_webhook_rate_limit_reached():
 
 # This is how many times we will try to deliver the webhook before giving up.
 MAX_WEBHOOK_DELIVERY_ATTEMPTS = int(os.getenv("MAX_WEBHOOK_DELIVERY_ATTEMPTS", 3))
+# The ``ended`` state is the durable hand-off to FirstLine's post-meeting
+# analysis. It gets a larger bounded budget and scheduler reconciliation than
+# ordinary notifications, while retaining the same idempotency key.
+POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS = int(os.getenv("POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS", 12))
+POST_PROCESSING_WEBHOOK_REENQUEUE_SECONDS = int(os.getenv("POST_PROCESSING_WEBHOOK_REENQUEUE_SECONDS", 300))
 # This is how many times the task can be retried before giving up.
 # This is distinct from MAX_WEBHOOK_DELIVERY_ATTEMPTS because the task can also be retried for
 # reasons other than delivery failures (e.g., rate limiting enforced by Attendee via GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT or unexpected exceptions).
-DELIVER_WEBHOOK_TASK_MAX_RETRIES = int(os.getenv("DELIVER_WEBHOOK_TASK_MAX_RETRIES", MAX_WEBHOOK_DELIVERY_ATTEMPTS))
+DELIVER_WEBHOOK_TASK_MAX_RETRIES = int(
+    os.getenv(
+        "DELIVER_WEBHOOK_TASK_MAX_RETRIES",
+        max(MAX_WEBHOOK_DELIVERY_ATTEMPTS, POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS),
+    )
+)
+
+
+def is_post_processing_webhook_delivery(delivery: WebhookDeliveryAttempt) -> bool:
+    """Return whether this is the durable ``ended`` hand-off to FirstLine."""
+    return (
+        delivery.webhook_trigger_type == WebhookTriggerTypes.BOT_STATE_CHANGE
+        and isinstance(delivery.payload, dict)
+        and delivery.payload.get("new_state") == "ended"
+    )
+
+
+def delivery_attempt_limit(delivery: WebhookDeliveryAttempt) -> int:
+    if is_post_processing_webhook_delivery(delivery):
+        return POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS
+    return MAX_WEBHOOK_DELIVERY_ATTEMPTS
+
+
+def enqueue_post_processing_webhook_delivery(delivery_id: int) -> bool:
+    """Requeue an interrupted ``ended`` delivery without creating a new event."""
+    try:
+        with transaction.atomic():
+            delivery = WebhookDeliveryAttempt.objects.select_for_update().get(id=delivery_id)
+            if (
+                not is_post_processing_webhook_delivery(delivery)
+                or delivery.status == WebhookDeliveryAttemptStatus.SUCCESS
+                or delivery.attempt_count >= delivery_attempt_limit(delivery)
+            ):
+                return False
+            delivery.status = WebhookDeliveryAttemptStatus.PENDING
+            delivery.save(update_fields=["status", "updated_at"])
+            transaction.on_commit(lambda: deliver_webhook.delay(delivery.id))
+        return True
+    except Exception:
+        # Keep the persisted delivery observable. The scheduler will try again
+        # while the bounded delivery budget remains.
+        logger.exception("Could not requeue post-processing webhook delivery %s", delivery_id)
+        return False
 
 
 @shared_task(
@@ -170,8 +218,9 @@ def deliver_webhook(self, delivery_id):
 
     if delivery.status == WebhookDeliveryAttemptStatus.FAILURE:
         # Check if this was the last retry attempt
-        if delivery.attempt_count >= MAX_WEBHOOK_DELIVERY_ATTEMPTS:
+        attempt_limit = delivery_attempt_limit(delivery)
+        if delivery.attempt_count >= attempt_limit:
             logger.error(f"Webhook delivery failed after {delivery.attempt_count} attempts. " + f"Webhook ID: {delivery.id}, URL: {subscription.url}, " + f"Event: {delivery.webhook_trigger_type}, Status: {delivery.status}")
         else:
-            logger.info(f"Retrying webhook delivery {delivery.id} (attempt {delivery.attempt_count}/{MAX_WEBHOOK_DELIVERY_ATTEMPTS})")
+            logger.info(f"Retrying webhook delivery {delivery.id} (attempt {delivery.attempt_count}/{attempt_limit})")
             raise Exception("Retry due to failure")

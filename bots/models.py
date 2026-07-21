@@ -2210,6 +2210,14 @@ class RecordingTranscriptionStates(models.IntegerChoices):
         return mapping.get(value)
 
 
+class ExternalMediaUploadStates(models.IntegerChoices):
+    NOT_REQUESTED = 1, "Not Requested"
+    PENDING = 2, "Pending"
+    UPLOADING = 3, "Uploading"
+    COMPLETE = 4, "Complete"
+    FAILED = 5, "Failed"
+
+
 class RecordingTypes(models.IntegerChoices):
     AUDIO_AND_VIDEO = 1, "Audio and Video"
     AUDIO_ONLY = 2, "Audio Only"
@@ -2285,6 +2293,21 @@ class Recording(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     first_buffer_timestamp_ms = models.BigIntegerField(null=True, blank=True)
+
+    # The primary Attendee recording is stored before this delivery begins. The
+    # state below makes the optional customer-controlled copy observable and
+    # recoverable after process or network failures.
+    external_media_upload_state = models.IntegerField(
+        choices=ExternalMediaUploadStates.choices,
+        default=ExternalMediaUploadStates.NOT_REQUESTED,
+        null=False,
+    )
+    external_media_upload_attempt_count = models.IntegerField(default=0, null=False)
+    external_media_upload_requested_at = models.DateTimeField(null=True, blank=True)
+    external_media_upload_enqueued_at = models.DateTimeField(null=True, blank=True)
+    external_media_upload_started_at = models.DateTimeField(null=True, blank=True)
+    external_media_upload_completed_at = models.DateTimeField(null=True, blank=True)
+    external_media_upload_failure_data = models.JSONField(null=True, default=None)
 
     file = models.FileField(storage=RecordingStorage())
 
@@ -2662,6 +2685,10 @@ class Utterance(models.Model):
     transcription = models.JSONField(null=True, default=None)
     # To keep track of how many retries we've done for this utterance
     transcription_attempt_count = models.IntegerField(default=0)
+    # A task claim prevents duplicate broker deliveries from submitting the
+    # same audio segment to a transcription provider more than once.
+    transcription_processing_task_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    transcription_processing_started_at = models.DateTimeField(null=True, blank=True)
     failure_data = models.JSONField(null=True, default=None)
     source_uuid = models.CharField(max_length=255, null=True, unique=True)
 

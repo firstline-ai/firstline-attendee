@@ -23,7 +23,11 @@ from bots.models import (
     WebhookTriggerTypes,
 )
 from bots.projects_views import CreateWebhookView, DeleteWebhookView, ProjectWebhooksView
-from bots.tasks.deliver_webhook_task import deliver_webhook
+from bots.tasks.deliver_webhook_task import (
+    POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS,
+    deliver_webhook,
+    delivery_attempt_limit,
+)
 from bots.webhook_utils import sign_payload, verify_signature
 
 
@@ -358,6 +362,17 @@ class WebhookDeliveryTest(TransactionTestCase):
         self.assertEqual(len(attempt.response_body_list), 3)
         self.assertIsNone(attempt.succeeded_at)
         self.assertEqual(attempt.attempt_count, 3)
+
+    def test_ended_webhook_uses_extended_delivery_budget(self):
+        attempt = WebhookDeliveryAttempt.objects.create(
+            webhook_subscription=self.webhook_subscription,
+            webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE,
+            bot=self.bot,
+            idempotency_key=uuid.uuid4(),
+            payload={"new_state": "ended"},
+        )
+
+        self.assertEqual(delivery_attempt_limit(attempt), POST_PROCESSING_WEBHOOK_MAX_ATTEMPTS)
 
     @patch("bots.tasks.deliver_webhook_task.requests.post")
     def test_webhook_delivery_inactive(self, mock_post):
