@@ -5,6 +5,7 @@ import os
 import random
 import signal
 import time
+import uuid
 
 import redis
 from django.conf import settings
@@ -14,9 +15,10 @@ from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import Bot, BotStates, Calendar, CalendarStates, Utterance, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
+from bots.tasks.process_utterance_task import TRANSCRIPTION_CLAIM_STALE_SECONDS, process_utterance
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
 from bots.tasks.sync_calendar_task import enqueue_sync_calendar_task
 from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_connection_task
@@ -86,6 +88,7 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
+                self._run_stale_transcription_claims()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
@@ -291,3 +294,69 @@ class Command(BaseCommand):
             enqueue_autopay_charge_task(organization)
 
         log.info("Enqueued %d autopay tasks", len(organizations))
+
+    def _run_stale_transcription_claims(self):
+        """Recover regular utterances when a broker delivery or worker dies mid-transcription."""
+        now = timezone.now()
+        stale_cutoff = now - timezone.timedelta(seconds=TRANSCRIPTION_CLAIM_STALE_SECONDS)
+        stale_utterances = (
+            Utterance.objects.filter(
+                async_transcription__isnull=True,
+                transcription__isnull=True,
+                failure_data__isnull=True,
+            )
+            .filter(
+                Q(
+                    transcription_processing_task_id__isnull=True,
+                    created_at__lte=stale_cutoff,
+                )
+                | Q(
+                    transcription_processing_task_id__isnull=False,
+                    transcription_processing_started_at__lte=stale_cutoff,
+                )
+            )
+            .order_by("created_at")[:100]
+        )
+
+        recovered = 0
+        for utterance in stale_utterances:
+            recovery_task_id = str(uuid.uuid4())
+            claim_filter = Q(
+                transcription_processing_task_id__isnull=True,
+                created_at__lte=stale_cutoff,
+            ) | Q(
+                transcription_processing_task_id__isnull=False,
+                transcription_processing_started_at__lte=stale_cutoff,
+            )
+
+            with transaction.atomic():
+                claimed = (
+                    Utterance.objects.filter(
+                        id=utterance.id,
+                        async_transcription__isnull=True,
+                        transcription__isnull=True,
+                        failure_data__isnull=True,
+                    )
+                    .filter(claim_filter)
+                    .update(
+                        transcription_processing_task_id=recovery_task_id,
+                        transcription_processing_started_at=now,
+                    )
+                )
+                if not claimed:
+                    continue
+
+                def enqueue_recovery(utterance_id=utterance.id, task_id=recovery_task_id):
+                    try:
+                        process_utterance.apply_async(args=[utterance_id], task_id=task_id)
+                    except Exception:
+                        Utterance.objects.filter(
+                            id=utterance_id,
+                            transcription_processing_task_id=task_id,
+                        ).update(transcription_processing_started_at=stale_cutoff)
+                        log.exception("Could not enqueue stale transcription claim for utterance %s", utterance_id)
+
+                transaction.on_commit(enqueue_recovery)
+                recovered += 1
+
+        log.info("Recovered %d stale or missing transcription task(s)", recovered)

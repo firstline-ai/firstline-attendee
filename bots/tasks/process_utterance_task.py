@@ -5,14 +5,20 @@ import time
 
 import requests
 from celery import shared_task
-
-logger = logging.getLogger(__name__)
+from django.db.models import Q
+from django.utils import timezone
 
 from bots.models import Credentials, RecordingManager, TranscriptionFailureReasons, TranscriptionProviders, Utterance, WebhookTriggerTypes
 from bots.transcription_utils import get_transcription_via_assemblyai_from_mp3, is_retryable_failure
 from bots.utils import pcm_to_mp3
 from bots.webhook_payloads import utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
+
+logger = logging.getLogger(__name__)
+
+PCM_BYTES_PER_SAMPLE = 2
+DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS = 25
+TRANSCRIPTION_CLAIM_STALE_SECONDS = int(os.getenv("TRANSCRIPTION_CLAIM_STALE_SECONDS", 900))
 
 
 def transform_diarized_json_to_schema(result):
@@ -79,7 +85,26 @@ def get_transcription(utterance):
     max_retries=6,
 )
 def process_utterance(self, utterance_id):
-    utterance = Utterance.objects.get(id=utterance_id)
+    task_id = str(self.request.id or f"inline-{utterance_id}")
+    now = timezone.now()
+    stale_cutoff = now - timezone.timedelta(seconds=TRANSCRIPTION_CLAIM_STALE_SECONDS)
+    claimed = (
+        Utterance.objects.filter(
+            id=utterance_id,
+            transcription__isnull=True,
+            failure_data__isnull=True,
+        )
+        .filter(Q(transcription_processing_task_id__isnull=True) | Q(transcription_processing_task_id=task_id) | Q(transcription_processing_started_at__lte=stale_cutoff))
+        .update(
+            transcription_processing_task_id=task_id,
+            transcription_processing_started_at=now,
+        )
+    )
+    if not claimed:
+        logger.info("Utterance %s already has a completed transcription or active claim", utterance_id)
+        return
+
+    utterance = Utterance.objects.select_related("recording__bot", "audio_chunk").get(id=utterance_id)
     logger.info(f"Processing utterance {utterance_id}")
 
     recording = utterance.recording
@@ -114,6 +139,8 @@ def process_utterance(self, utterance_id):
             utterance.audio_chunk.clear_audio_data()
 
         utterance.transcription = transcription
+        utterance.transcription_processing_task_id = None
+        utterance.transcription_processing_started_at = None
         utterance.save()
 
         logger.info(f"Transcription complete for utterance {utterance_id}")
@@ -523,35 +550,51 @@ def get_transcription_via_elevenlabs(utterance):
         return None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e)}
 
 
-def get_transcription_via_custom_async(utterance):
-    transcription_settings = utterance.transcription_settings
+def custom_async_pcm_chunks(pcm_audio, sample_rate, max_chunk_duration_seconds):
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if max_chunk_duration_seconds <= 0:
+        raise ValueError("max_chunk_duration_seconds must be positive")
 
-    # Get the base URL from environment variable
-    base_url = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_URL")
-    if not base_url:
-        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND, "error": "CUSTOM_ASYNC_TRANSCRIPTION_URL environment variable not set"}
+    bytes_per_second = sample_rate * PCM_BYTES_PER_SAMPLE
+    max_chunk_bytes = bytes_per_second * max_chunk_duration_seconds
+    max_chunk_bytes -= max_chunk_bytes % PCM_BYTES_PER_SAMPLE
 
-    # Get additional properties from settings
-    additional_props = transcription_settings.custom_async_additional_props()
+    if len(pcm_audio) <= max_chunk_bytes:
+        return [(0.0, pcm_audio)]
 
-    payload_mp3 = pcm_to_mp3(utterance.get_audio_blob().tobytes(), sample_rate=utterance.get_sample_rate())
+    chunks = []
+    for start_byte in range(0, len(pcm_audio), max_chunk_bytes):
+        offset_seconds = start_byte / bytes_per_second
+        chunks.append((offset_seconds, pcm_audio[start_byte : start_byte + max_chunk_bytes]))
+    return chunks
 
+
+def combine_custom_async_transcriptions(transcriptions_with_offsets):
+    transcript_parts = []
+    words = []
+
+    for offset_seconds, transcription in transcriptions_with_offsets:
+        transcript = transcription.get("transcript")
+        if transcript:
+            transcript_parts.append(transcript)
+
+        for word in transcription.get("words", []):
+            adjusted_word = word.copy()
+            if "start" in adjusted_word:
+                adjusted_word["start"] = round(float(adjusted_word["start"]) + offset_seconds, 3)
+            if "end" in adjusted_word:
+                adjusted_word["end"] = round(float(adjusted_word["end"]) + offset_seconds, 3)
+            words.append(adjusted_word)
+
+    return {"transcript": " ".join(transcript_parts).strip(), "words": words}
+
+
+def transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout):
     files = {"audio": ("audio.mp3", payload_mp3, "audio/mpeg")}
 
-    # Add additional properties as form data
-    data = {}
-    for key, value in additional_props.items():
-        if isinstance(value, (dict, list)):
-            data[key] = json.dumps(value)
-        else:
-            data[key] = value
-
-    # Get timeout from environment or use default (120 retries like Gladia and AssemblyAI)
-    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "120"))  # 120 seconds default timeout
-
     try:
-        # Make the POST request to the custom transcription service
-        logger.info(f"Sending audio to custom async service at {base_url}")
+        logger.info("Sending audio to custom async service at %s", base_url)
         response = requests.post(base_url, files=files, data=data if data else None, timeout=timeout)
 
         if response.status_code == 401:
@@ -561,8 +604,12 @@ def get_transcription_via_custom_async(utterance):
             return None, {"reason": TranscriptionFailureReasons.RATE_LIMIT_EXCEEDED, "status_code": response.status_code}
 
         if response.status_code != 200:
-            logger.error(f"Custom async transcription failed with status code {response.status_code}: {response.text}")
-            return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "status_code": response.status_code, "response_text": response.text}
+            logger.error("Custom async transcription failed with status code %s", response.status_code)
+            return None, {
+                "reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED,
+                "status_code": response.status_code,
+                "response_text": response.text,
+            }
 
         result_data = response.json()
         logger.info("Custom async transcription request completed")
@@ -574,33 +621,93 @@ def get_transcription_via_custom_async(utterance):
             transcription["transcript"] = transcription["full_transcript"]
             del transcription["full_transcript"]
 
-            # Extract all words from all utterances into a flat list
             all_words = []
-            for utt in transcription["utterances"]:
-                if "words" in utt:
-                    all_words.extend(utt["words"])
+            for utterance in transcription["utterances"]:
+                if "words" in utterance:
+                    all_words.extend(utterance["words"])
             transcription["words"] = all_words
             del transcription["utterances"]
 
             return transcription, None
 
-        elif status == "error":
+        if status == "error":
             error_code = result_data.get("error_code")
             return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_result_poll", "error_code": error_code}
 
-        else:
-            # Unknown status
-            return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_result_poll", "status": status}
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "step": "transcribe_result_poll", "status": status}
 
     except requests.exceptions.Timeout:
-        logger.error(f"Custom async transcription request timed out after {timeout} seconds")
+        logger.error("Custom async transcription request timed out after %s seconds", timeout)
         return None, {"reason": TranscriptionFailureReasons.TIMED_OUT, "timeout": timeout}
     except requests.exceptions.RequestException as e:
-        logger.error(f"Custom async transcription request failed: {str(e)}")
+        logger.error("Custom async transcription request failed: %s", e)
         return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": str(e)}
     except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Custom async transcription response parsing failed: {str(e)}")
-        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": f"Invalid JSON response: {str(e)}"}
+        logger.error("Custom async transcription response parsing failed: %s", e)
+        return None, {"reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED, "error": f"Invalid JSON response: {e}"}
     except Exception as e:
-        logger.error(f"Custom async transcription unexpected error: {str(e)}")
+        logger.error("Custom async transcription unexpected error: %s", e)
         return None, {"reason": TranscriptionFailureReasons.INTERNAL_ERROR, "error": str(e)}
+
+
+def custom_async_max_chunk_duration_seconds():
+    configured_value = os.getenv("CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS", str(DEFAULT_CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS))
+    try:
+        duration_seconds = int(configured_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS must be a positive integer") from error
+
+    if duration_seconds <= 0:
+        raise ValueError("CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS must be a positive integer")
+
+    return duration_seconds
+
+
+def get_transcription_via_custom_async(utterance):
+    transcription_settings = utterance.transcription_settings
+
+    # Get the base URL from environment variable
+    base_url = os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_URL")
+    if not base_url:
+        return None, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND, "error": "CUSTOM_ASYNC_TRANSCRIPTION_URL environment variable not set"}
+
+    # Get additional properties from settings
+    additional_props = transcription_settings.custom_async_additional_props()
+
+    # Add additional properties as form data
+    data = {}
+    for key, value in additional_props.items():
+        if isinstance(value, (dict, list)):
+            data[key] = json.dumps(value)
+        else:
+            data[key] = value
+
+    # Get timeout from environment or use default (120 retries like Gladia and AssemblyAI)
+    timeout = int(os.getenv("CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT", "120"))  # 120 seconds default timeout
+    try:
+        max_chunk_duration_seconds = custom_async_max_chunk_duration_seconds()
+    except ValueError as error:
+        logger.error("Custom async transcription configuration error: %s", error)
+        return None, {"reason": TranscriptionFailureReasons.CONFIGURATION_ERROR, "error": str(error)}
+
+    pcm_audio = utterance.get_audio_blob().tobytes()
+    sample_rate = utterance.get_sample_rate()
+    chunks = custom_async_pcm_chunks(pcm_audio, sample_rate, max_chunk_duration_seconds)
+
+    if len(chunks) > 1:
+        logger.info(
+            "Splitting custom async utterance %s into %s chunks of up to %ss",
+            utterance.id,
+            len(chunks),
+            max_chunk_duration_seconds,
+        )
+
+    transcriptions_with_offsets = []
+    for offset_seconds, pcm_chunk in chunks:
+        payload_mp3 = pcm_to_mp3(pcm_chunk, sample_rate=sample_rate)
+        transcription, failure_data = transcribe_custom_async_mp3(base_url, payload_mp3, data, timeout)
+        if failure_data:
+            return None, failure_data
+        transcriptions_with_offsets.append((offset_seconds, transcription))
+
+    return combine_custom_async_transcriptions(transcriptions_with_offsets), None

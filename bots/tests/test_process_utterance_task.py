@@ -1,7 +1,9 @@
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
+from django.utils import timezone
 
 from bots.models import (
     AudioChunk,
@@ -16,7 +18,18 @@ from bots.models import (
     TranscriptionFailureReasons,
     Utterance,
 )
-from bots.tasks.process_utterance_task import get_transcription_via_assemblyai, get_transcription_via_custom_async, get_transcription_via_deepgram, get_transcription_via_elevenlabs, get_transcription_via_gladia, get_transcription_via_openai, get_transcription_via_sarvam, process_utterance
+from bots.tasks.process_utterance_task import (
+    combine_custom_async_transcriptions,
+    custom_async_pcm_chunks,
+    get_transcription_via_assemblyai,
+    get_transcription_via_custom_async,
+    get_transcription_via_deepgram,
+    get_transcription_via_elevenlabs,
+    get_transcription_via_gladia,
+    get_transcription_via_openai,
+    get_transcription_via_sarvam,
+    process_utterance,
+)
 
 
 class ProcessUtteranceTaskTest(TransactionTestCase):
@@ -79,6 +92,8 @@ class ProcessUtteranceTaskTest(TransactionTestCase):
         self.assertEqual(self.utterance.audio_blob, b"")
         self.assertIsNone(self.utterance.failure_data)
         self.assertEqual(self.utterance.transcription_attempt_count, 1)
+        self.assertIsNone(self.utterance.transcription_processing_task_id)
+        self.assertIsNone(self.utterance.transcription_processing_started_at)
 
         # Recording manager called because this was the last outstanding utterance
         mock_set_complete.assert_called_once_with(self.recording)
@@ -98,6 +113,107 @@ class ProcessUtteranceTaskTest(TransactionTestCase):
         self.utterance.refresh_from_db()
         self.assertEqual(self.utterance.transcription_attempt_count, 1)
         self.assertIsNone(self.utterance.failure_data)
+
+    @mock.patch("bots.tasks.process_utterance_task.get_transcription")
+    def test_active_transcription_claim_prevents_duplicate_provider_call(self, mock_get_transcription):
+        self.utterance.transcription_processing_task_id = "another-task"
+        self.utterance.transcription_processing_started_at = timezone.now()
+        self.utterance.save(
+            update_fields=[
+                "transcription_processing_task_id",
+                "transcription_processing_started_at",
+            ]
+        )
+
+        self._run_task()
+
+        mock_get_transcription.assert_not_called()
+
+
+class CustomAsyncChunkingTest(SimpleTestCase):
+    @staticmethod
+    def _utterance_with_pcm(pcm_audio):
+        return SimpleNamespace(
+            id="utterance-for-chunk-test",
+            transcription_settings=SimpleNamespace(custom_async_additional_props=lambda: {}),
+            get_audio_blob=lambda: memoryview(pcm_audio),
+            get_sample_rate=lambda: 16000,
+        )
+
+    def test_pcm_chunks_split_at_requested_duration(self):
+        chunks = custom_async_pcm_chunks(b"x" * 24, sample_rate=4, max_chunk_duration_seconds=1)
+
+        self.assertEqual(chunks, [(0.0, b"x" * 8), (1.0, b"x" * 8), (2.0, b"x" * 8)])
+
+    def test_pcm_chunks_reject_invalid_duration(self):
+        with self.assertRaises(ValueError):
+            custom_async_pcm_chunks(b"x", sample_rate=4, max_chunk_duration_seconds=0)
+
+    def test_combined_words_keep_their_absolute_offsets(self):
+        transcription = combine_custom_async_transcriptions(
+            [
+                (0.0, {"transcript": "first", "words": [{"word": "first", "start": 0.0, "end": 0.5}]}),
+                (25.0, {"transcript": "second", "words": [{"word": "second", "start": 0.25, "end": 0.75}]}),
+            ]
+        )
+
+        self.assertEqual(transcription["transcript"], "first second")
+        self.assertEqual(transcription["words"][1], {"word": "second", "start": 25.25, "end": 25.75})
+
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", side_effect=[b"part-1", b"part-2", b"part-3"])
+    def test_long_audio_is_transcribed_in_chunks_with_absolute_word_offsets(self, mock_pcm, mock_post):
+        def successful_response(word):
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {
+                "status": "done",
+                "result": {
+                    "transcription": {
+                        "full_transcript": word,
+                        "utterances": [{"words": [{"word": word, "start": 0.0, "end": 0.5}]}],
+                    }
+                },
+            }
+            return response
+
+        mock_post.side_effect = [successful_response("one"), successful_response("two"), successful_response("three")]
+        utterance = self._utterance_with_pcm(b"x" * (3 * 16000 * 2))
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CUSTOM_ASYNC_TRANSCRIPTION_URL": "http://test-service.com/transcribe",
+                "CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT": "120",
+                "CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS": "1",
+            },
+        ):
+            transcript, failure = get_transcription_via_custom_async(utterance)
+
+        self.assertIsNone(failure)
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(mock_pcm.call_count, 3)
+        self.assertEqual(transcript["transcript"], "one two three")
+        self.assertEqual([word["start"] for word in transcript["words"]], [0.0, 1.0, 2.0])
+
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3")
+    def test_invalid_chunk_duration_fails_without_sending_audio(self, mock_pcm, mock_post):
+        utterance = self._utterance_with_pcm(b"x")
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CUSTOM_ASYNC_TRANSCRIPTION_URL": "http://test-service.com/transcribe",
+                "CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT": "120",
+                "CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS": "0",
+            },
+        ):
+            transcript, failure = get_transcription_via_custom_async(utterance)
+
+        self.assertIsNone(transcript)
+        self.assertEqual(failure["reason"], TranscriptionFailureReasons.CONFIGURATION_ERROR)
+        mock_pcm.assert_not_called()
+        mock_post.assert_not_called()
 
 
 class BotModelRedactionSettingsTest(TransactionTestCase):
@@ -1739,9 +1855,16 @@ class CustomAsyncProviderTest(TransactionTestCase):
 
     # ------------------------------------------------------------------ helpers
 
-    def _patch_env(self, url="http://test-service.com/transcribe", timeout="120"):
+    def _patch_env(self, url="http://test-service.com/transcribe", timeout="120", max_chunk_duration_seconds="25"):
         """Mock environment variables."""
-        return mock.patch.dict("os.environ", {"CUSTOM_ASYNC_TRANSCRIPTION_URL": url, "CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT": timeout})
+        return mock.patch.dict(
+            "os.environ",
+            {
+                "CUSTOM_ASYNC_TRANSCRIPTION_URL": url,
+                "CUSTOM_ASYNC_TRANSCRIPTION_TIMEOUT": timeout,
+                "CUSTOM_ASYNC_MAX_CHUNK_DURATION_SECONDS": max_chunk_duration_seconds,
+            },
+        )
 
     # ------------------------------------------------------------------ SUCCESS PATH
 
