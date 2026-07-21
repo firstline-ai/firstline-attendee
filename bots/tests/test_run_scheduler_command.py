@@ -8,7 +8,22 @@ from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
 from bots.management.commands.run_scheduler import CALENDAR_SYNC_THRESHOLD_HOURS, Command
-from bots.models import Bot, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import (
+    Bot,
+    BotStates,
+    Calendar,
+    CalendarPlatform,
+    CalendarStates,
+    Project,
+    WebhookDeliveryAttempt,
+    WebhookDeliveryAttemptStatus,
+    WebhookSecret,
+    WebhookSubscription,
+    WebhookTriggerTypes,
+    ZoomOAuthApp,
+    ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
+)
 
 
 def _build_celery_unacked_entry(bot_id, join_at_iso):
@@ -66,6 +81,30 @@ class RunSchedulerCommandTestCase(TestCase):
 
         # Verify the shutdown flag was set
         self.assertFalse(command._keep_running)
+
+    @patch("bots.management.commands.run_scheduler.enqueue_post_processing_webhook_delivery", return_value=True)
+    def test_run_pending_post_processing_webhooks_requeues_failed_ended_delivery(self, mock_enqueue):
+        subscription = WebhookSubscription.objects.create(
+            project=self.project,
+            url="https://example.com/webhook",
+            triggers=[WebhookTriggerTypes.BOT_STATE_CHANGE],
+        )
+        WebhookSecret.objects.create(project=self.project)
+        bot = Bot.objects.create(project=self.project, meeting_url="https://example.com/meeting", state=BotStates.ENDED)
+        delivery = WebhookDeliveryAttempt.objects.create(
+            webhook_subscription=subscription,
+            webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE,
+            bot=bot,
+            idempotency_key="00000000-0000-0000-0000-000000000001",
+            payload={"new_state": "ended"},
+            status=WebhookDeliveryAttemptStatus.FAILURE,
+            attempt_count=1,
+            last_attempt_at=self.now - django_timezone.timedelta(minutes=10),
+        )
+
+        Command()._run_pending_post_processing_webhooks()
+
+        mock_enqueue.assert_called_once_with(delivery.id)
 
     def test_run_scheduled_bots_ignores_bots_outside_time_threshold(self):
         """Test that bots outside the 5-minute time window are ignored"""

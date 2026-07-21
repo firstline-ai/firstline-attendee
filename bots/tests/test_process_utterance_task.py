@@ -2,6 +2,7 @@ import uuid
 from unittest import mock
 
 from django.test import TransactionTestCase
+from django.utils import timezone
 
 from bots.models import (
     AudioChunk,
@@ -79,6 +80,8 @@ class ProcessUtteranceTaskTest(TransactionTestCase):
         self.assertEqual(self.utterance.audio_blob, b"")
         self.assertIsNone(self.utterance.failure_data)
         self.assertEqual(self.utterance.transcription_attempt_count, 1)
+        self.assertIsNone(self.utterance.transcription_processing_task_id)
+        self.assertIsNone(self.utterance.transcription_processing_started_at)
 
         # Recording manager called because this was the last outstanding utterance
         mock_set_complete.assert_called_once_with(self.recording)
@@ -98,6 +101,21 @@ class ProcessUtteranceTaskTest(TransactionTestCase):
         self.utterance.refresh_from_db()
         self.assertEqual(self.utterance.transcription_attempt_count, 1)
         self.assertIsNone(self.utterance.failure_data)
+
+    @mock.patch("bots.tasks.process_utterance_task.get_transcription")
+    def test_active_transcription_claim_prevents_duplicate_provider_call(self, mock_get_transcription):
+        self.utterance.transcription_processing_task_id = "another-task"
+        self.utterance.transcription_processing_started_at = timezone.now()
+        self.utterance.save(
+            update_fields=[
+                "transcription_processing_task_id",
+                "transcription_processing_started_at",
+            ]
+        )
+
+        self._run_task()
+
+        mock_get_transcription.assert_not_called()
 
 
 class BotModelRedactionSettingsTest(TransactionTestCase):
