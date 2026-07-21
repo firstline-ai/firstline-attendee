@@ -10,48 +10,88 @@
 
 services:
   attendee-app:
-    image: firstline-attendee:latest
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
+      DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
     volumes:
-      - /home/deploy/apps/attendee/staticfiles:/attendee/staticfiles
+      - ${ATTENDEE_HOST_CODE_PATH:?Set ATTENDEE_HOST_CODE_PATH to the matching release checkout}/staticfiles:/attendee/staticfiles
     command: >
       gunicorn attendee.wsgi:application
         --bind 127.0.0.1:8000 --workers 4 --timeout 120
     depends_on: [postgres, redis]
 
   attendee-worker:
-    image: firstline-attendee:latest
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
+      HOME: /home/app
       ENABLE_CHROME_SANDBOX: "false"
       LAUNCH_BOT_METHOD: docker-compose-multi-host
       BOT_MEMORY_LIMIT: "2g"
       BOT_CPU_QUOTA: "100000" # 1 vCPU por bot
       BOT_MAX_SIMULTANEOUS_BOTS: "8"
-      BOT_CONTAINER_IMAGE: "firstline-attendee:latest"
-      # Caminho no HOST onde o código foi clonado (onde está o manage.py)
-      # Ajuste para o caminho real no servidor de produção
-      BOT_HOST_CODE_PATH: "/home/deploy/apps/attendee"
+      BOT_CONTAINER_IMAGE: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
+      BOT_HOST_CODE_PATH: ${ATTENDEE_HOST_CODE_PATH:?Set ATTENDEE_HOST_CODE_PATH to the matching release checkout}
+      BOT_CONTAINER_AUTO_REMOVE: "true"
+      DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # -Q celery,bot_launcher_vm: obrigatório para receber tarefas de lançamento de bots
-    command: celery -A attendee worker -l INFO -Q celery,bot_launcher_vm
+    group_add:
+      - "${DOCKER_GID:-989}"
+    command: celery -A attendee worker -n worker@%h -l INFO -Q celery -I bots.tasks.joining_watchdog_task
     depends_on: [postgres, redis]
 
-  attendee-scheduler:
-    image: firstline-attendee:latest
+  attendee-launcher-worker:
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
+      HOME: /home/app
+      ENABLE_CHROME_SANDBOX: "false"
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
+      BOT_MEMORY_LIMIT: "2g"
+      BOT_CPU_QUOTA: "100000"
+      BOT_MAX_SIMULTANEOUS_BOTS: "8"
+      BOT_CONTAINER_IMAGE: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
+      BOT_HOST_CODE_PATH: ${ATTENDEE_HOST_CODE_PATH:?Set ATTENDEE_HOST_CODE_PATH to the matching release checkout}
+      BOT_CONTAINER_AUTO_REMOVE: "true"
+      DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-989}"
+    command: celery -A attendee worker -n launcher@%h -l INFO -Q bot_launcher_vm -c 2 -I bots.tasks.joining_watchdog_task
+    depends_on: [postgres, redis]
+
+  attendee-webhook-worker:
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
+    command: celery -A attendee worker -n webhook@%h -l INFO -Q webhooks --concurrency=2
+    depends_on: [postgres, redis]
+
+  attendee-scheduler:
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
+    restart: always
+    network_mode: host
+    env_file: .env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
     entrypoint: []
     command: python manage.py run_scheduler
     depends_on: [postgres, redis]

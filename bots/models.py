@@ -2462,6 +2462,7 @@ class RecordingManager:
 class TranscriptionFailureReasons(models.TextChoices):
     CREDENTIALS_NOT_FOUND = "credentials_not_found"
     CREDENTIALS_INVALID = "credentials_invalid"
+    CONFIGURATION_ERROR = "configuration_error"
     RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
     AUDIO_UPLOAD_FAILED = "audio_upload_failed"
     TRANSCRIPTION_REQUEST_FAILED = "transcription_request_failed"
@@ -2662,6 +2663,10 @@ class Utterance(models.Model):
     transcription = models.JSONField(null=True, default=None)
     # To keep track of how many retries we've done for this utterance
     transcription_attempt_count = models.IntegerField(default=0)
+    # A task claim prevents duplicate broker deliveries from submitting the
+    # same audio segment to a transcription provider more than once.
+    transcription_processing_task_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    transcription_processing_started_at = models.DateTimeField(null=True, blank=True)
     failure_data = models.JSONField(null=True, default=None)
     source_uuid = models.CharField(max_length=255, null=True, unique=True)
 
