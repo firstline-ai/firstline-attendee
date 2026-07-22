@@ -296,7 +296,6 @@ def _mark_ready(
         completed_at = timezone.now()
         recording.file = primary_key
         recording.external_storage_key = external_key
-        recording.local_file_path = None
         recording.file_size_bytes = file_size_bytes
         recording.file_sha256 = file_sha256
         recording.duration_ms = duration_ms
@@ -309,7 +308,6 @@ def _mark_ready(
             update_fields=[
                 "file",
                 "external_storage_key",
-                "local_file_path",
                 "file_size_bytes",
                 "file_sha256",
                 "duration_ms",
@@ -341,6 +339,28 @@ def _mark_ready(
         )
 
 
+def cleanup_ready_recording_spool(recording_id: int) -> bool:
+    """Remove a delivered local file and clear its durable recovery pointer."""
+    recording = Recording.objects.only("id", "delivery_state", "local_file_path").get(id=recording_id)
+    if recording.delivery_state != RecordingDeliveryStates.READY or not recording.local_file_path:
+        return False
+
+    path = Path(recording.local_file_path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        # Keep local_file_path durable so the scheduler can retry cleanup.
+        logger.exception("Could not remove delivered recording spool file for recording %s", recording_id)
+        return False
+
+    cleared = Recording.objects.filter(
+        id=recording_id,
+        delivery_state=RecordingDeliveryStates.READY,
+        local_file_path=str(path),
+    ).update(local_file_path=None, updated_at=timezone.now())
+    return bool(cleared)
+
+
 @shared_task(bind=True, max_retries=MAX_RECORDING_DELIVERY_RETRIES)
 def deliver_recording(self, recording_id: int) -> None:
     """Validate, persist and announce one logical audio recording."""
@@ -365,8 +385,6 @@ def deliver_recording(self, recording_id: int) -> None:
             file_sha256=file_sha256,
             duration_ms=duration_ms,
         )
-        path.unlink(missing_ok=True)
-        logger.info("Recording %s is ready for post-meeting processing", recording.id)
     except Exception as exc:
         terminal = self.request.retries >= self.max_retries
         _mark_failed(recording.id, exc, terminal=terminal)
@@ -376,3 +394,11 @@ def deliver_recording(self, recording_id: int) -> None:
         countdown = min(300, 2 ** max(0, self.request.retries))
         logger.warning("Recording delivery failed for %s; retrying in %ss", recording.id, countdown)
         raise self.retry(exc=exc, countdown=countdown)
+
+    try:
+        cleanup_ready_recording_spool(recording.id)
+    except Exception:
+        # Delivery is already durable and announced. Never downgrade READY due
+        # to a local cleanup failure; the scheduler will retry it independently.
+        logger.exception("Could not finalize local spool cleanup for recording %s", recording.id)
+    logger.info("Recording %s is ready for post-meeting processing", recording.id)

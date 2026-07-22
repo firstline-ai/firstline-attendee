@@ -37,6 +37,7 @@ from bots.tasks.process_utterance_task import TRANSCRIPTION_CLAIM_STALE_SECONDS,
 from bots.tasks.recording_delivery_task import (
     MAX_RECORDING_DELIVERY_RETRIES,
     RECORDING_DELIVERY_ACTIVE_SECONDS,
+    cleanup_ready_recording_spool,
     enqueue_recording_delivery,
     recover_recording_from_spool,
 )
@@ -393,6 +394,24 @@ class Command(BaseCommand):
         active_cutoff = now - timezone.timedelta(seconds=RECORDING_DELIVERY_ACTIVE_SECONDS)
         orphan_cutoff = now - timezone.timedelta(seconds=RECORDING_ORPHAN_RECOVERY_GRACE_SECONDS)
 
+        ready_with_local_spool = (
+            Recording.objects.filter(
+                transcription_type=TranscriptionTypes.NO_TRANSCRIPTION,
+                delivery_state=RecordingDeliveryStates.READY,
+                local_file_path__isnull=False,
+            )
+            .exclude(local_file_path="")
+            .order_by("updated_at")
+            .values_list("id", flat=True)[:100]
+        )
+        cleaned = 0
+        for recording_id in ready_with_local_spool:
+            try:
+                if cleanup_ready_recording_spool(recording_id):
+                    cleaned += 1
+            except Exception:
+                log.exception("Could not clean delivered spool file for recording %s", recording_id)
+
         pending = (
             Recording.objects.filter(transcription_type=TranscriptionTypes.NO_TRANSCRIPTION)
             .filter(
@@ -433,7 +452,12 @@ class Command(BaseCommand):
             except Exception:
                 log.exception("Could not recover recording %s from the durable spool", recording.id)
 
-        log.info("Requeued %d recording delivery task(s); recovered %d orphaned recording(s)", requeued, recovered)
+        log.info(
+            "Cleaned %d delivered spool file(s); requeued %d recording delivery task(s); recovered %d orphaned recording(s)",
+            cleaned,
+            requeued,
+            recovered,
+        )
 
     def _mark_crashed_recording_only_bots(self, now):
         """Move a stale bot to fatal only after Docker confirms it is gone."""

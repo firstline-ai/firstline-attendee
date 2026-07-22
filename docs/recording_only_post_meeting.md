@@ -45,6 +45,8 @@ o identificador do ativo; use `recording_id`/`object_key`.
   `bot_id`/`recording_id`, tenta repará-lo com FFmpeg e retoma a entrega.
 - O arquivo local só é apagado depois da confirmação de tamanho no storage
   primário e no R2/S3 externo.
+- Se o worker parar depois de confirmar a entrega e antes de apagar o arquivo,
+  o scheduler retoma essa limpeza de forma idempotente.
 - Falhas persistentes mantêm o arquivo no spool e registram apenas dados de erro
   sanitizados no banco.
 

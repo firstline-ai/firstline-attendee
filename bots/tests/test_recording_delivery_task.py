@@ -21,7 +21,7 @@ from bots.models import (
     WebhookSubscription,
     WebhookTriggerTypes,
 )
-from bots.tasks.recording_delivery_task import deliver_recording, expected_spool_path, recover_recording_from_spool
+from bots.tasks.recording_delivery_task import cleanup_ready_recording_spool, deliver_recording, expected_spool_path, recover_recording_from_spool
 
 
 class RecordingDeliveryTaskTests(TestCase):
@@ -94,6 +94,36 @@ class RecordingDeliveryTaskTests(TestCase):
                 1,
             )
 
+    @patch("bots.tasks.recording_delivery_task.cleanup_ready_recording_spool", side_effect=RuntimeError("worker stopped before cleanup"))
+    @patch("bots.tasks.recording_delivery_task._upload_external", return_value="meetings/test.mp3")
+    @patch("bots.tasks.recording_delivery_task._upload_primary", return_value="primary/test.mp3")
+    @patch("bots.tasks.recording_delivery_task._repair_mp3_if_needed", return_value=12345)
+    def test_ready_delivery_keeps_durable_pointer_until_local_cleanup_succeeds(
+        self,
+        _mock_repair,
+        _mock_primary,
+        _mock_external,
+        _mock_cleanup,
+    ):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            path = Path(temp_directory) / "recording.mp3"
+            path.write_bytes(b"complete meeting audio")
+            self.recording.local_file_path = str(path)
+            self.recording.delivery_state = RecordingDeliveryStates.STAGED
+            self.recording.save(update_fields=["local_file_path", "delivery_state", "updated_at"])
+
+            deliver_recording.run(self.recording.id)
+
+            self.recording.refresh_from_db()
+            self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.READY)
+            self.assertEqual(self.recording.local_file_path, str(path))
+            self.assertTrue(path.exists())
+
+            self.assertTrue(cleanup_ready_recording_spool(self.recording.id))
+            self.recording.refresh_from_db()
+            self.assertIsNone(self.recording.local_file_path)
+            self.assertFalse(path.exists())
+
     @patch("bots.tasks.recording_delivery_task._enqueue_task", return_value=False)
     def test_orphaned_spool_file_is_preserved_and_marked_partial(self, _mock_enqueue):
         with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
@@ -145,3 +175,32 @@ class RecordingDeliveryTaskTests(TestCase):
         Command()._run_pending_recording_deliveries()
 
         mock_enqueue.assert_called_once_with(self.recording.id)
+
+    def test_scheduler_cleans_ready_recording_spool_after_worker_interruption(self):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            path = Path(temp_directory) / "recording.mp3"
+            path.write_bytes(b"delivered meeting audio")
+            self.recording.delivery_state = RecordingDeliveryStates.READY
+            self.recording.local_file_path = str(path)
+            self.recording.save(update_fields=["delivery_state", "local_file_path", "updated_at"])
+
+            Command()._run_pending_recording_deliveries()
+
+            self.recording.refresh_from_db()
+            self.assertIsNone(self.recording.local_file_path)
+            self.assertFalse(path.exists())
+
+    def test_cleanup_failure_preserves_durable_pointer_for_scheduler_retry(self):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            path = Path(temp_directory) / "recording.mp3"
+            path.write_bytes(b"delivered meeting audio")
+            self.recording.delivery_state = RecordingDeliveryStates.READY
+            self.recording.local_file_path = str(path)
+            self.recording.save(update_fields=["delivery_state", "local_file_path", "updated_at"])
+
+            with patch.object(Path, "unlink", side_effect=PermissionError("read-only spool")):
+                self.assertFalse(cleanup_ready_recording_spool(self.recording.id))
+
+            self.recording.refresh_from_db()
+            self.assertEqual(self.recording.local_file_path, str(path))
+            self.assertTrue(path.exists())

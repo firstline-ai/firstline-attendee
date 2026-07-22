@@ -53,6 +53,22 @@ class RecordingOnlyContractTests(SimpleTestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn("transcription_settings", serializer.errors)
 
+    def test_recording_only_mode_rejects_legacy_async_audio_chunks(self):
+        serializer = CreateBotSerializer(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recorder",
+                "recording_settings": {
+                    "format": "mp3",
+                    "record_async_transcription_audio_chunks": True,
+                },
+                "transcription_settings": {"none": {}},
+            }
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("recording_settings", serializer.errors)
+
     def test_none_is_not_an_async_transcription_provider(self):
         serializer = CreateAsyncTranscriptionSerializer(data={"transcription_settings": {"none": {}}})
 

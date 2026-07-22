@@ -1693,6 +1693,17 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         if unexpected_fields:
             raise serializers.ValidationError(f"Unexpected field(s): {', '.join(sorted(unexpected_fields))}. Allowed fields are: {', '.join(sorted(expected_fields))}")
 
+        transcription_settings = data.get("transcription_settings") or {}
+        recording_settings = data.get("recording_settings") or {}
+        if "none" in transcription_settings and recording_settings.get("record_async_transcription_audio_chunks"):
+            raise serializers.ValidationError(
+                {
+                    "recording_settings": {
+                        "record_async_transcription_audio_chunks": "Must be false when transcription_settings.none is enabled."
+                    }
+                }
+            )
+
         return data
 
 
@@ -2059,6 +2070,22 @@ class PatchBotSerializer(BotValidationMixin, serializers.Serializer):
 
     def validate_metadata(self, value):
         return _validate_metadata_attribute(value)
+
+    def validate(self, data):
+        bot = self.context.get("bot")
+        recording_settings = data.get("recording_settings")
+        if not bot or not bot.transcription_is_disabled() or not recording_settings:
+            return data
+
+        errors = {}
+        if recording_settings.get("format") != RecordingFormats.MP3:
+            errors["format"] = "Must remain 'mp3' when transcription_settings.none is enabled."
+        if recording_settings.get("record_async_transcription_audio_chunks"):
+            errors["record_async_transcription_audio_chunks"] = "Must be false when transcription_settings.none is enabled."
+        if errors:
+            raise serializers.ValidationError({"recording_settings": errors})
+
+        return data
 
 
 @extend_schema_serializer(
