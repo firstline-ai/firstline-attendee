@@ -390,7 +390,7 @@ def patch_bot(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
     """
 
     # Validate the request data
-    serializer = PatchBotSerializer(data=data)
+    serializer = PatchBotSerializer(data=data, context={"bot": bot})
     if not serializer.is_valid():
         return None, serializer.errors
 

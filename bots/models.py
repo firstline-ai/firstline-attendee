@@ -1087,6 +1087,10 @@ class Bot(models.Model):
         return recording_settings.get("reserve_additional_storage", False)
 
     def record_async_transcription_audio_chunks(self):
+        # Recording-only bots must never initialize the legacy per-participant
+        # chunk pipeline, even if an older client persisted this flag as true.
+        if self.transcription_is_disabled():
+            return False
         if not self.project.organization.is_async_transcription_enabled:
             return False
         recording_settings = self.settings.get("recording_settings", {})
