@@ -87,6 +87,8 @@ from gi.repository import GLib
 
 logger = logging.getLogger(__name__)
 
+SCHEDULED_GOOGLE_MEET_ONLY_PARTICIPANT_TIMEOUT_SECONDS = 300
+
 
 class BotController:
     # Default wait time for utterance termination (5 minutes)
@@ -696,7 +698,7 @@ class BotController:
         self.pubsub = None
         self.pubsub_channel = f"bot_{self.bot_in_db.id}"
 
-        self.automatic_leave_configuration = AutomaticLeaveConfiguration(**self.bot_in_db.automatic_leave_settings())
+        self.automatic_leave_configuration = self.get_automatic_leave_configuration()
 
         self.per_participant_realtime_video_configuration = PerParticipantRealtimeVideoConfiguration(
             webcam_configuration=PerParticipantRealtimeVideoSourceConfiguration(resolution=self.bot_in_db.websocket_per_participant_video_webcam_resolution()),
@@ -704,6 +706,21 @@ class BotController:
         )
 
         self.pipeline_configuration = self.get_pipeline_configuration()
+
+    def get_automatic_leave_configuration(self):
+        settings = dict(self.bot_in_db.automatic_leave_settings())
+
+        if self.bot_in_db.join_at is not None and self.get_meeting_type() == MeetingTypes.GOOGLE_MEET:
+            configured_timeout = settings.get(
+                "only_participant_in_meeting_timeout_seconds",
+                AutomaticLeaveConfiguration.only_participant_in_meeting_timeout_seconds,
+            )
+            settings["only_participant_in_meeting_timeout_seconds"] = max(
+                configured_timeout,
+                SCHEDULED_GOOGLE_MEET_ONLY_PARTICIPANT_TIMEOUT_SECONDS,
+            )
+
+        return AutomaticLeaveConfiguration(**settings)
 
     def get_pipeline_configuration(self):
         if self.bot_in_db.rtmp_destination_url():

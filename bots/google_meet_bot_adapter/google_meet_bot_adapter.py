@@ -9,6 +9,8 @@ from bots.web_bot_adapter import WebBotAdapter
 
 logger = logging.getLogger(__name__)
 
+SCHEDULED_GOOGLE_MEET_JOIN_LEAD_SECONDS = 75
+
 
 class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
     def __init__(
@@ -84,7 +86,7 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
             logger.error("In update_closed_captions_language, failed to set closed captions language programatically")
 
     def get_staged_bot_join_delay_seconds(self):
-        return 5
+        return SCHEDULED_GOOGLE_MEET_JOIN_LEAD_SECONDS
 
     def subclass_specific_initial_data_code(self):
         return f"""
