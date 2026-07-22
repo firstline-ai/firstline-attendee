@@ -37,12 +37,14 @@ from .models import (
     MeetingTypes,
     ParticipantEventTypes,
     Recording,
+    RecordingDeliveryStates,
     RecordingFormats,
     RecordingResolutions,
     RecordingStates,
     RecordingTranscriptionStates,
     RecordingViews,
     TranscriptionProviders,
+    TranscriptionTypes,
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
 )
@@ -258,6 +260,12 @@ BOT_IMAGE_SCHEMA = {
 TRANSCRIPTION_SETTINGS_SCHEMA = {
     "type": "object",
     "properties": {
+        "none": {
+            "type": "object",
+            "description": "Disable in-meeting transcription while retaining the recording for post-meeting processing.",
+            "properties": {},
+            "additionalProperties": False,
+        },
         "deepgram": {
             "type": "object",
             "properties": {
@@ -1145,6 +1153,9 @@ class CreateAsyncTranscriptionSerializer(serializers.Serializer):
         if "meeting_closed_captions" in value:
             raise serializers.ValidationError({"transcription_settings": "Meeting closed captions are not available for async transcription."})
 
+        if "none" in value:
+            raise serializers.ValidationError({"transcription_settings": "A transcription provider is required for async transcription."})
+
         if value.get("deepgram", {}).get("callback"):
             raise serializers.ValidationError({"transcription_settings": "Deepgram callback is not available for async transcription."})
 
@@ -1363,6 +1374,16 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             jsonschema.validate(instance=value, schema=TRANSCRIPTION_SETTINGS_SCHEMA)
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
+
+        if "none" in value and len(value) != 1:
+            raise serializers.ValidationError({"transcription_settings": "The 'none' mode cannot be combined with a transcription provider."})
+
+        if "none" in value:
+            if meeting_type != MeetingTypes.GOOGLE_MEET:
+                raise serializers.ValidationError({"transcription_settings": "The 'none' mode is currently supported only for Google Meet bots."})
+            recording_format = (self.initial_data.get("recording_settings") or {}).get("format", RecordingFormats.MP4)
+            if recording_format != RecordingFormats.MP3:
+                raise serializers.ValidationError({"transcription_settings": "The 'none' mode currently requires recording_settings.format='mp3'."})
 
         # If deepgram key is specified but language is not, set to "multi"
         if "deepgram" in value and ("language" not in value["deepgram"] or value["deepgram"]["language"] is None):
@@ -1672,6 +1693,17 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         if unexpected_fields:
             raise serializers.ValidationError(f"Unexpected field(s): {', '.join(sorted(unexpected_fields))}. Allowed fields are: {', '.join(sorted(expected_fields))}")
 
+        transcription_settings = data.get("transcription_settings") or {}
+        recording_settings = data.get("recording_settings") or {}
+        if "none" in transcription_settings and recording_settings.get("record_async_transcription_audio_chunks"):
+            raise serializers.ValidationError(
+                {
+                    "recording_settings": {
+                        "record_async_transcription_audio_chunks": "Must be false when transcription_settings.none is enabled."
+                    }
+                }
+            )
+
         return data
 
 
@@ -1682,6 +1714,7 @@ class BotSerializer(serializers.ModelSerializer):
     events = serializers.SerializerMethodField()
     transcription_state = serializers.SerializerMethodField()
     recording_state = serializers.SerializerMethodField()
+    recording_delivery_state = serializers.SerializerMethodField()
     join_at = serializers.DateTimeField()
     deduplication_key = serializers.CharField()
 
@@ -1749,6 +1782,20 @@ class BotSerializer(serializers.ModelSerializer):
 
         return RecordingStates.state_to_api_code(default_recording.state)
 
+    @extend_schema_field(
+        {
+            "type": "string",
+            "enum": [RecordingDeliveryStates.state_to_api_code(state.value) for state in RecordingDeliveryStates],
+        }
+    )
+    def get_recording_delivery_state(self, obj):
+        if not obj.uses_durable_recording_spool():
+            return None
+        default_recording = Recording.objects.filter(bot=obj, is_default_recording=True).first()
+        if not default_recording:
+            return None
+        return RecordingDeliveryStates.state_to_api_code(default_recording.delivery_state)
+
     class Meta:
         model = Bot
         fields = [
@@ -1759,6 +1806,7 @@ class BotSerializer(serializers.ModelSerializer):
             "events",
             "transcription_state",
             "recording_state",
+            "recording_delivery_state",
             "join_at",
             "deduplication_key",
         ]
@@ -1788,10 +1836,25 @@ class TranscriptUtteranceSerializer(serializers.Serializer):
 )
 class RecordingSerializer(serializers.ModelSerializer):
     start_timestamp_ms = serializers.IntegerField(source="first_buffer_timestamp_ms")
+    delivery_state = serializers.SerializerMethodField()
+
+    def get_delivery_state(self, obj):
+        if obj.transcription_type != TranscriptionTypes.NO_TRANSCRIPTION:
+            return None
+        return RecordingDeliveryStates.state_to_api_code(obj.delivery_state)
 
     class Meta:
         model = Recording
-        fields = ["url", "start_timestamp_ms"]
+        fields = [
+            "url",
+            "start_timestamp_ms",
+            "delivery_state",
+            "is_partial",
+            "duration_ms",
+            "file_size_bytes",
+            "file_sha256",
+            "external_storage_key",
+        ]
 
 
 @extend_schema_field(
@@ -2007,6 +2070,22 @@ class PatchBotSerializer(BotValidationMixin, serializers.Serializer):
 
     def validate_metadata(self, value):
         return _validate_metadata_attribute(value)
+
+    def validate(self, data):
+        bot = self.context.get("bot")
+        recording_settings = data.get("recording_settings")
+        if not bot or not bot.transcription_is_disabled() or not recording_settings:
+            return data
+
+        errors = {}
+        if recording_settings.get("format") != RecordingFormats.MP3:
+            errors["format"] = "Must remain 'mp3' when transcription_settings.none is enabled."
+        if recording_settings.get("record_async_transcription_audio_chunks"):
+            errors["record_async_transcription_audio_chunks"] = "Must be false when transcription_settings.none is enabled."
+        if errors:
+            raise serializers.ValidationError({"recording_settings": errors})
+
+        return data
 
 
 @extend_schema_serializer(

@@ -11,6 +11,7 @@ from .models import (
     ParticipantEvent,
     ParticipantEventTypes,
     TranscriptionProviders,
+    TranscriptionTypes,
 )
 from .templatetags.bot_filters import participant_color as compute_participant_color
 
@@ -472,6 +473,8 @@ def transcription_provider_from_bot_creation_data(data):
     settings = data.get("transcription_settings", {})
     use_zoom_web_adapter = data.get("zoom_settings", {}).get("sdk") == "web"
 
+    if "none" in settings:
+        return None
     if "deepgram" in settings:
         return TranscriptionProviders.DEEPGRAM
     elif "gladia" in settings:
@@ -495,6 +498,13 @@ def transcription_provider_from_bot_creation_data(data):
     if meeting_type_from_url(url) == MeetingTypes.ZOOM and not use_zoom_web_adapter:
         return TranscriptionProviders.DEEPGRAM
     return TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
+
+
+def transcription_type_from_bot_creation_data(data):
+    settings = data.get("transcription_settings", {}) or {}
+    if "none" in settings:
+        return TranscriptionTypes.NO_TRANSCRIPTION
+    return TranscriptionTypes.NON_REALTIME
 
 
 def generate_async_transcriptions_json_for_bot_detail_view(recording):

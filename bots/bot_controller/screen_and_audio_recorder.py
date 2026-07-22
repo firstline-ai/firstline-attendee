@@ -85,7 +85,12 @@ class ScreenAndAudioRecorder:
         if not self.ffmpeg_proc:
             return
         self.ffmpeg_proc.terminate()
-        self.ffmpeg_proc.wait()
+        try:
+            self.ffmpeg_proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            logger.warning("FFmpeg did not stop within 30 seconds; forcing termination")
+            self.ffmpeg_proc.kill()
+            self.ffmpeg_proc.wait(timeout=10)
         self.ffmpeg_proc = None
         logger.info(f"Stopped screen and audio recorder for display with dimensions {self.screen_dimensions} and file location {self.file_location}")
 

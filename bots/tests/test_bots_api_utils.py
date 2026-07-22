@@ -8,7 +8,7 @@ from django.utils import timezone
 from accounts.models import Organization
 from bots.bots_api_utils import BotCreationSource, build_site_url, create_bot, create_webhook_subscription, patch_bot, validate_bot_concurrency_limit, validate_meeting_url_and_credentials
 from bots.calendars_api_utils import create_calendar
-from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, TranscriptionProviders, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
+from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, RecordingDeliveryStates, TranscriptionProviders, TranscriptionTypes, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
 
 
 class TestBuildSiteUrl(TestCase):
@@ -80,6 +80,53 @@ class TestCreateBot(TestCase):
         self.assertIsNotNone(bot)
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNone(error)
+
+    def test_create_google_meet_recording_only_bot(self):
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recording Only Bot",
+                "recording_settings": {"format": "mp3"},
+                "transcription_settings": {"none": {}},
+                "webhooks": [{"url": "https://example.com/recording", "triggers": ["recording.ready"]}],
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNone(error)
+        self.assertTrue(bot.transcription_is_disabled())
+        self.assertTrue(bot.uses_durable_recording_spool())
+        recording = bot.recordings.get(is_default_recording=True)
+        self.assertEqual(recording.transcription_type, TranscriptionTypes.NO_TRANSCRIPTION)
+        self.assertIsNone(recording.transcription_provider)
+        self.assertEqual(recording.delivery_state, RecordingDeliveryStates.NOT_STARTED)
+        self.assertEqual(bot.bot_webhook_subscriptions.get().triggers, [WebhookTriggerTypes.RECORDING_READY])
+
+    def test_recording_only_bot_ignores_legacy_async_audio_chunk_flag_at_runtime(self):
+        self.project.organization.is_async_transcription_enabled = True
+        self.project.organization.save(update_fields=["is_async_transcription_enabled", "updated_at"])
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recording Only Bot",
+                "recording_settings": {"format": "mp3"},
+                "transcription_settings": {"none": {}},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNone(error)
+        bot.settings["recording_settings"]["record_async_transcription_audio_chunks"] = True
+        bot.save(update_fields=["settings", "updated_at"])
+
+        from bots.bot_controller.bot_controller import BotController
+
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = bot
+        self.assertFalse(bot.record_async_transcription_audio_chunks())
+        self.assertFalse(controller.should_capture_audio_chunks())
 
     def test_create_zoom_bot_with_default_settings(self):
         ZoomOAuthApp.objects.create(project=self.project, client_id="123")
@@ -921,6 +968,54 @@ class TestPatchBot(TestCase):
         self.assertIsNotNone(updated_bot)
         self.assertIsNone(patch_error)
         self.assertEqual(updated_bot.settings["recording_settings"], {**BOT_RECORDING_SETTINGS_DEFAULT_VALUES, "record_async_transcription_audio_chunks": True})
+
+    def test_patch_recording_only_bot_rejects_legacy_async_audio_chunks(self):
+        future_time = timezone.now() + timedelta(hours=1)
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recording Only Bot",
+                "join_at": future_time.isoformat(),
+                "recording_settings": {"format": "mp3"},
+                "transcription_settings": {"none": {}},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+        self.assertIsNone(error)
+
+        updated_bot, patch_error = patch_bot(
+            bot,
+            {
+                "recording_settings": {
+                    "format": "mp3",
+                    "record_async_transcription_audio_chunks": True,
+                }
+            },
+        )
+
+        self.assertIsNone(updated_bot)
+        self.assertIn("recording_settings", patch_error)
+
+    def test_patch_recording_only_bot_must_keep_mp3_format(self):
+        future_time = timezone.now() + timedelta(hours=1)
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recording Only Bot",
+                "join_at": future_time.isoformat(),
+                "recording_settings": {"format": "mp3"},
+                "transcription_settings": {"none": {}},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+        self.assertIsNone(error)
+
+        updated_bot, patch_error = patch_bot(bot, {"recording_settings": {"format": "mp4"}})
+
+        self.assertIsNone(updated_bot)
+        self.assertIn("recording_settings", patch_error)
 
 
 class TestConcurrentBotLimit(TestCase):

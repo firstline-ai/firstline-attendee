@@ -52,6 +52,7 @@ from bots.models import (
     RecordingManager,
     RecordingTypes,
     TranscriptionProviders,
+    TranscriptionTypes,
     Utterance,
     WebhookTriggerTypes,
 )
@@ -110,10 +111,12 @@ class BotController:
             return self.per_participant_non_streaming_audio_input_manager
 
     def save_utterances_for_individual_audio_chunks(self):
-        return self.get_recording_transcription_provider() != TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
+        recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
+        return recording.transcription_type != TranscriptionTypes.NO_TRANSCRIPTION and recording.transcription_provider != TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
 
     def save_utterances_for_closed_captions(self):
-        return self.get_recording_transcription_provider() == TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
+        recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
+        return recording.transcription_type != TranscriptionTypes.NO_TRANSCRIPTION and recording.transcription_provider == TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
 
     def should_capture_audio_chunks(self):
         return self.save_utterances_for_individual_audio_chunks() or self.bot_in_db.record_async_transcription_audio_chunks()
@@ -202,6 +205,7 @@ class BotController:
             add_encoded_mp4_chunk_callback=None,
             recording_view=self.bot_in_db.recording_view(),
             google_meet_closed_captions_language=self.bot_in_db.transcription_settings.google_meet_closed_captions_language(),
+            should_enable_closed_captions=self.save_utterances_for_closed_captions(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording if self.screen_and_audio_recorder else None,
             stop_recording_screen_callback=self.screen_and_audio_recorder.stop_recording if self.screen_and_audio_recorder else None,
@@ -623,16 +627,29 @@ class BotController:
 
         if self.adapter:
             logger.info("Telling adapter to leave meeting...")
-            self.adapter.leave()
+            try:
+                self.adapter.leave()
+            except Exception:
+                self.recording_interrupted = True
+                logger.exception("Adapter failed while leaving the meeting; continuing recording cleanup")
             logger.info("Telling adapter to cleanup...")
-            self.adapter.cleanup()
+            try:
+                self.adapter.cleanup()
+            except Exception:
+                self.recording_interrupted = True
+                logger.exception("Adapter cleanup failed; continuing recording cleanup")
 
         if self.main_loop and self.main_loop.is_running():
             self.main_loop.quit()
 
         if self.screen_and_audio_recorder:
             logger.info("Telling media recorder receiver to cleanup...")
-            self.screen_and_audio_recorder.cleanup()
+            try:
+                self.screen_and_audio_recorder.stop_recording()
+                self.screen_and_audio_recorder.cleanup()
+            except Exception:
+                self.recording_interrupted = True
+                logger.exception("Media recorder cleanup failed; preserving any available recording")
 
         if self.realtime_audio_output_manager:
             logger.info("Telling realtime audio output manager to cleanup...")
@@ -647,16 +664,37 @@ class BotController:
             self.websocket_client_manager.cleanup()
 
         if self.get_recording_file_location():
-            self.upload_recording_to_external_media_storage_if_enabled()
+            if self.bot_in_db.uses_durable_recording_spool():
+                try:
+                    from bots.tasks.recording_delivery_task import stage_recording_for_delivery
 
-            logger.info("Telling file uploader to upload recording file...")
-            file_uploader = self.get_file_uploader()
-            file_uploader.upload_file(self.get_recording_file_location())
-            file_uploader.wait_for_upload()
-            logger.info("File uploader finished uploading file")
-            file_uploader.delete_file(self.get_recording_file_location())
-            logger.info("File uploader deleted file from local filesystem")
-            self.recording_file_saved(file_uploader.filename)
+                    recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
+                    try:
+                        recording.first_buffer_timestamp_ms = self.get_first_buffer_timestamp_ms()
+                        recording.save(update_fields=["first_buffer_timestamp_ms", "updated_at"])
+                    except Exception:
+                        logger.exception("Could not persist the recording start timestamp; continuing delivery")
+                    stage_recording_for_delivery(
+                        recording.id,
+                        self.get_recording_file_location(),
+                        is_partial=self.recording_interrupted,
+                    )
+                    logger.info("Recording staged for crash-safe post-meeting delivery")
+                except Exception:
+                    # The scheduler can recover the deterministic spool path
+                    # after this browser container exits.
+                    logger.exception("Could not stage recording; preserving local spool file for recovery")
+            else:
+                self.upload_recording_to_external_media_storage_if_enabled()
+
+                logger.info("Telling file uploader to upload recording file...")
+                file_uploader = self.get_file_uploader()
+                file_uploader.upload_file(self.get_recording_file_location())
+                file_uploader.wait_for_upload()
+                logger.info("File uploader finished uploading file")
+                file_uploader.delete_file(self.get_recording_file_location())
+                logger.info("File uploader deleted file from local filesystem")
+                self.recording_file_saved(file_uploader.filename)
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()
@@ -665,7 +703,8 @@ class BotController:
             self.audio_chunk_uploader.shutdown()
 
         if self.bot_in_db.state == BotStates.POST_PROCESSING:
-            self.wait_until_all_utterances_are_terminated()
+            if not self.bot_in_db.transcription_is_disabled():
+                self.wait_until_all_utterances_are_terminated()
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.POST_PROCESSING_COMPLETED)
 
         normal_quitting_process_worked = True
@@ -693,6 +732,7 @@ class BotController:
         self.bot_in_db = Bot.objects.get(id=bot_id)
         self.cleanup_called = False
         self.run_called = False
+        self.recording_interrupted = False
 
         self.redis_client = None
         self.pubsub = None
@@ -766,6 +806,10 @@ class BotController:
             return os.path.join(self.get_recording_storage_directory(), self.get_recording_filename())
 
     def get_recording_storage_directory(self):
+        if self.bot_in_db.uses_durable_recording_spool():
+            spool_directory = os.getenv("BOT_RECORDING_SPOOL_DIRECTORY", "/attendee-recording-spool")
+            os.makedirs(spool_directory, mode=0o700, exist_ok=True)
+            return spool_directory
         if self.bot_in_db.reserve_additional_storage():
             return "/bot-persistent-storage"
         else:
@@ -837,29 +881,33 @@ class BotController:
         # Initialize core objects
         # Only used for adapters that can provide per-participant audio
 
-        self.per_participant_non_streaming_audio_input_manager = PerParticipantNonStreamingAudioInputManager(
-            save_audio_chunk_callback=self.process_individual_audio_chunk,
-            get_participant_callback=self.get_participant,
-            sample_rate=self.get_per_participant_audio_sample_rate(),
-            utterance_size_limit=self.non_streaming_audio_utterance_size_limit(),
-            silence_duration_limit=self.non_streaming_audio_silence_duration_limit(),
-            should_print_diagnostic_info=self.should_capture_audio_chunks(),
-        )
+        self.per_participant_non_streaming_audio_input_manager = None
+        self.per_participant_streaming_audio_input_manager = None
+        if self.should_capture_audio_chunks():
+            self.per_participant_non_streaming_audio_input_manager = PerParticipantNonStreamingAudioInputManager(
+                save_audio_chunk_callback=self.process_individual_audio_chunk,
+                get_participant_callback=self.get_participant,
+                sample_rate=self.get_per_participant_audio_sample_rate(),
+                utterance_size_limit=self.non_streaming_audio_utterance_size_limit(),
+                silence_duration_limit=self.non_streaming_audio_silence_duration_limit(),
+                should_print_diagnostic_info=True,
+            )
 
-        self.per_participant_streaming_audio_input_manager = PerParticipantStreamingAudioInputManager(
-            get_participant_callback=self.get_participant,
-            sample_rate=self.get_per_participant_audio_sample_rate(),
-            transcription_provider=self.get_recording_transcription_provider(),
-            bot=self.bot_in_db,
-        )
+            self.per_participant_streaming_audio_input_manager = PerParticipantStreamingAudioInputManager(
+                get_participant_callback=self.get_participant,
+                sample_rate=self.get_per_participant_audio_sample_rate(),
+                transcription_provider=self.get_recording_transcription_provider(),
+                bot=self.bot_in_db,
+            )
 
         # Only used for adapters that can provide closed captions
-        if self.bot_in_db.transcription_settings.meeting_closed_captions_merge_consecutive_captions():
+        self.closed_caption_manager = None
+        if self.save_utterances_for_closed_captions() and self.bot_in_db.transcription_settings.meeting_closed_captions_merge_consecutive_captions():
             self.closed_caption_manager = GroupedClosedCaptionManager(
                 save_utterance_callback=self.save_closed_caption_utterance,
                 get_participant_callback=self.get_participant,
             )
-        else:
+        elif self.save_utterances_for_closed_captions():
             self.closed_caption_manager = ClosedCaptionManager(
                 save_utterance_callback=self.save_closed_caption_utterance,
                 get_participant_callback=self.get_participant,
@@ -936,7 +984,7 @@ class BotController:
         self.bot_resource_snapshot_taker = BotResourceSnapshotTaker(self.bot_in_db)
 
         self.audio_chunk_uploader = None
-        if settings.USE_REMOTE_STORAGE_FOR_AUDIO_CHUNKS:
+        if self.should_capture_audio_chunks() and settings.USE_REMOTE_STORAGE_FOR_AUDIO_CHUNKS:
             self.audio_chunk_uploader = AudioChunkUploader(
                 on_success=self.on_audio_chunk_upload_success,
                 on_error=self.on_audio_chunk_upload_error,
@@ -993,6 +1041,7 @@ class BotController:
             self.main_loop.run()
         except Exception as e:
             logger.warning(f"Error in bot {self.bot_in_db.id}: {str(e)}")
+            self.recording_interrupted = True
             self.cleanup()
         finally:
             # Clean up Redis subscription
@@ -1149,6 +1198,7 @@ class BotController:
 
     def handle_glib_shutdown(self):
         logger.info("handle_glib_shutdown called")
+        self.recording_interrupted = True
 
         try:
             BotEventManager.create_event(
@@ -1289,17 +1339,20 @@ class BotController:
             self.set_bot_heartbeat()
 
             # Process audio chunks
-            self.per_participant_non_streaming_audio_input_manager.process_chunks()
+            if self.per_participant_non_streaming_audio_input_manager:
+                self.per_participant_non_streaming_audio_input_manager.process_chunks()
 
             # Process completed audio chunk uploads
             if self.audio_chunk_uploader:
                 self.audio_chunk_uploader.process_uploads()
 
             # Monitor transcription
-            self.per_participant_streaming_audio_input_manager.monitor_transcription()
+            if self.per_participant_streaming_audio_input_manager:
+                self.per_participant_streaming_audio_input_manager.monitor_transcription()
 
             # Process captions
-            self.closed_caption_manager.process_captions()
+            if self.closed_caption_manager:
+                self.closed_caption_manager.process_captions()
 
             # Check if auto-leave conditions are met
             self.adapter.check_auto_leave_conditions()
@@ -1326,6 +1379,7 @@ class BotController:
             return False
 
     def handle_exception_in_timeout_callback(self, e):
+        self.recording_interrupted = True
         try:
             BotEventManager.create_event(
                 bot=self.bot_in_db,

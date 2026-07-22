@@ -29,7 +29,6 @@ from .models import (
     Recording,
     TranscriptionProviders,
     TranscriptionSettings,
-    TranscriptionTypes,
     WebhookSecret,
     WebhookSubscription,
     WebhookTriggerTypes,
@@ -40,7 +39,7 @@ from .serializers import (
     PatchBotTranscriptionSettingsSerializer,
     PatchBotVoiceAgentSettingsSerializer,
 )
-from .utils import transcription_provider_from_bot_creation_data
+from .utils import transcription_provider_from_bot_creation_data, transcription_type_from_bot_creation_data
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +268,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
             Recording.objects.create(
                 bot=bot,
                 recording_type=bot.recording_type(),
-                transcription_type=TranscriptionTypes.NON_REALTIME,
+                transcription_type=transcription_type_from_bot_creation_data(serializer.validated_data),
                 transcription_provider=transcription_provider_from_bot_creation_data(serializer.validated_data),
                 is_default_recording=True,
             )
@@ -387,7 +386,7 @@ def patch_bot(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
     """
 
     # Validate the request data
-    serializer = PatchBotSerializer(data=data)
+    serializer = PatchBotSerializer(data=data, context={"bot": bot})
     if not serializer.is_valid():
         return None, serializer.errors
 
