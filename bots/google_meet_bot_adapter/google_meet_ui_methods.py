@@ -260,6 +260,43 @@ class GoogleMeetUIMethods:
                 logger.warning(f"Could not find name input. Unknown error {e} of type {type(e)}. Raising UiCouldNotLocateElementException")
                 raise UiCouldNotLocateElementException("Could not find name input. Unknown error.", "name_input", e)
 
+    def should_enable_closed_captions(self):
+        return self.upsert_caption_callback is not None or self.google_meet_closed_captions_language is not None
+
+    def wait_until_admitted_to_meeting_without_captions(self):
+        num_attempts_to_look_for_leave_button = self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
+        logger.info("Waiting to be admitted without requiring captions...")
+        waiting_room_timeout_started_at = time.time()
+
+        for attempt_to_look_for_leave_button_index in range(num_attempts_to_look_for_leave_button):
+            try:
+                WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[jsname="CQylAd"][aria-label="Leave call"]')))
+                logger.info("Confirmed bot was admitted to meeting without requiring captions")
+                return
+            except TimeoutException as e:
+                self.look_for_blocked_element("wait_until_admitted_without_captions")
+                self.look_for_denied_your_request_element("wait_until_admitted_without_captions")
+                self.click_this_meeting_is_being_recorded_join_now_button("wait_until_admitted_without_captions")
+                self.click_others_may_see_your_meeting_differently_button("wait_until_admitted_without_captions")
+                self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "wait_until_admitted_without_captions")
+
+                last_check_timed_out = attempt_to_look_for_leave_button_index == num_attempts_to_look_for_leave_button - 1
+                if last_check_timed_out:
+                    self.look_for_asking_to_be_let_in_element_after_waiting_period_expired("wait_until_admitted_without_captions")
+                    logger.warning("Could not confirm admission without captions. Timed out. Raising UiCouldNotLocateElementException")
+                    raise UiCouldNotLocateElementException(
+                        "Could not confirm admission without captions. Timed out.",
+                        "wait_until_admitted_without_captions",
+                        e,
+                    )
+            except Exception as e:
+                logger.warning(f"Could not confirm admission without captions. Unknown error {e} of type {type(e)}. Raising UiCouldNotLocateElementException")
+                raise UiCouldNotLocateElementException(
+                    "Could not confirm admission without captions. Unknown error.",
+                    "wait_until_admitted_without_captions",
+                    e,
+                )
+
     def click_captions_button(self):
         num_attempts_to_look_for_captions_button = self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
         logger.info("Waiting for captions button...")
@@ -896,11 +933,21 @@ class GoogleMeetUIMethods:
         logger.info("Clicking the join button...")
         self.click_element(join_button, "join_button")
 
-        self.click_captions_button()
+        if self.should_enable_closed_captions():
+            self.click_captions_button()
+        else:
+            self.wait_until_admitted_to_meeting_without_captions()
 
         self.wait_for_host_if_needed()
 
-        self.set_layout(layout_to_select)
+        # Audio-only bots do not consume incoming video, so the Meet layout has no
+        # effect on their output.  Treating this cosmetic UI action as mandatory
+        # makes an audio transcription bot fail when Google changes the layout
+        # menu, before it can capture any audio.
+        if not self.disable_incoming_video:
+            self.set_layout(layout_to_select)
+        else:
+            logger.info("Skipping Meet layout selection because incoming video is disabled")
 
         if self.disable_incoming_video:
             self.disable_incoming_video_in_ui()

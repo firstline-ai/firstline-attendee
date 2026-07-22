@@ -11,6 +11,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.urls import reverse
 
+from .audio_chunk_retention import apply_audio_chunk_retention_policy
 from .meeting_url_utils import meeting_type_from_url
 from .models import (
     Bot,
@@ -209,7 +210,10 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     bot_name = serializer.validated_data["bot_name"]
     transcription_settings = serializer.validated_data["transcription_settings"]
     rtmp_settings = serializer.validated_data["rtmp_settings"]
-    recording_settings = serializer.validated_data["recording_settings"]
+    recording_settings = apply_audio_chunk_retention_policy(
+        serializer.validated_data["recording_settings"],
+        transcription_settings,
+    )
     debug_settings = serializer.validated_data["debug_settings"]
     automatic_leave_settings = serializer.validated_data["automatic_leave_settings"]
     google_meet_settings = serializer.validated_data["google_meet_settings"]
@@ -404,7 +408,10 @@ def patch_bot(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
             bot.name = validated_data.get("bot_name", bot.name)
             bot.metadata = validated_data.get("metadata", bot.metadata)
             if validated_data.get("recording_settings"):
-                bot.settings["recording_settings"] = validated_data.get("recording_settings")
+                bot.settings["recording_settings"] = apply_audio_chunk_retention_policy(
+                    validated_data.get("recording_settings"),
+                    bot.settings.get("transcription_settings", {}),
+                )
 
             # join_at, meeting_url, bot_name and bot_image can only be updated when the bot is scheduled state. For updating image after the bot is in a meeting, use the output_image endpoint.
             update_only_legal_for_scheduled_bots = bot.join_at != previous_join_at or bot.meeting_url != previous_meeting_url or bot.name != previous_bot_name or validated_data.get("bot_image") or validated_data.get("recording_settings")
