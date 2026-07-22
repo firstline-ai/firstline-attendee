@@ -197,6 +197,9 @@ CELERY_TASK_ROUTES = {
     "bots.tasks.deliver_webhook_task.deliver_webhook": {
         "queue": os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "celery"),
     },
+    "bots.tasks.recording_delivery_task.deliver_recording": {
+        "queue": os.getenv("RECORDING_DELIVERY_CELERY_QUEUE", "celery"),
+    },
 }
 
 if os.getenv("LAUNCH_BOT_METHOD") != "kubernetes" and os.getenv("LAUNCH_BOT_METHOD") != "docker-compose-multi-host":

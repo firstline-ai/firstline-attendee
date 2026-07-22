@@ -60,6 +60,7 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             "BOT_CPU_PERIOD",  # Only needed by launcher
             "BOT_MAX_EXECUTION_SECONDS",  # Only needed by launcher
             "BOT_MAX_SIMULTANEOUS_BOTS",  # Only needed by launcher
+            "ATTENDEE_RECORDING_SPOOL_HOST_PATH",  # Host-only bind mount source
             "PULSE_SERVER",  # Each ephemeral container should start its own PulseAudio server
             "PULSE_RUNTIME_PATH",  # Each container has its own runtime path
             "XDG_RUNTIME_DIR",  # Each container has its own runtime dir
@@ -106,6 +107,11 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         # The worker runs with .:/attendee mounted, so we need the host path
         host_code_path = os.getenv("BOT_HOST_CODE_PATH", "/opt/attendee")
         volumes = {host_code_path: {"bind": "/attendee", "mode": "rw"}}
+        if bot.uses_durable_recording_spool():
+            host_spool_path = os.getenv("ATTENDEE_RECORDING_SPOOL_HOST_PATH", "/var/lib/attendee/recordings")
+            container_spool_path = os.getenv("BOT_RECORDING_SPOOL_DIRECTORY", "/attendee-recording-spool")
+            volumes[host_spool_path] = {"bind": container_spool_path, "mode": "rw"}
+            labels["attendee.durable_recording"] = "true"
 
         # Launch ephemeral container
         container = client.containers.run(

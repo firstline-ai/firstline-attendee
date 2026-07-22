@@ -8,7 +8,7 @@ from django.utils import timezone
 from accounts.models import Organization
 from bots.bots_api_utils import BotCreationSource, build_site_url, create_bot, create_webhook_subscription, patch_bot, validate_bot_concurrency_limit, validate_meeting_url_and_credentials
 from bots.calendars_api_utils import create_calendar
-from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, TranscriptionProviders, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
+from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, RecordingDeliveryStates, TranscriptionProviders, TranscriptionTypes, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
 
 
 class TestBuildSiteUrl(TestCase):
@@ -80,6 +80,28 @@ class TestCreateBot(TestCase):
         self.assertIsNotNone(bot)
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNone(error)
+
+    def test_create_google_meet_recording_only_bot(self):
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Recording Only Bot",
+                "recording_settings": {"format": "mp3"},
+                "transcription_settings": {"none": {}},
+                "webhooks": [{"url": "https://example.com/recording", "triggers": ["recording.ready"]}],
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNone(error)
+        self.assertTrue(bot.transcription_is_disabled())
+        self.assertTrue(bot.uses_durable_recording_spool())
+        recording = bot.recordings.get(is_default_recording=True)
+        self.assertEqual(recording.transcription_type, TranscriptionTypes.NO_TRANSCRIPTION)
+        self.assertIsNone(recording.transcription_provider)
+        self.assertEqual(recording.delivery_state, RecordingDeliveryStates.NOT_STARTED)
+        self.assertEqual(bot.bot_webhook_subscriptions.get().triggers, [WebhookTriggerTypes.RECORDING_READY])
 
     def test_create_zoom_bot_with_default_settings(self):
         ZoomOAuthApp.objects.create(project=self.project, client_id="123")
