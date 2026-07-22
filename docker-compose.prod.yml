@@ -42,8 +42,10 @@ services:
       BOT_HOST_CODE_PATH: ${ATTENDEE_HOST_CODE_PATH:?Set ATTENDEE_HOST_CODE_PATH to the matching release checkout}
       BOT_CONTAINER_AUTO_REMOVE: "true"
       DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
+      BOT_RECORDING_SPOOL_DIRECTORY: "/attendee-recording-spool"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${ATTENDEE_RECORDING_SPOOL_HOST_PATH:-/var/lib/attendee/recordings}:/attendee-recording-spool
     group_add:
       - "${DOCKER_GID:-989}"
     command: celery -A attendee worker -n worker@%h -l INFO -Q celery -I bots.tasks.joining_watchdog_task
@@ -66,6 +68,8 @@ services:
       BOT_HOST_CODE_PATH: ${ATTENDEE_HOST_CODE_PATH:?Set ATTENDEE_HOST_CODE_PATH to the matching release checkout}
       BOT_CONTAINER_AUTO_REMOVE: "true"
       DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
+      BOT_RECORDING_SPOOL_DIRECTORY: "/attendee-recording-spool"
+      ATTENDEE_RECORDING_SPOOL_HOST_PATH: ${ATTENDEE_RECORDING_SPOOL_HOST_PATH:-/var/lib/attendee/recordings}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
@@ -92,8 +96,14 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       DELIVER_WEBHOOK_CELERY_QUEUE: "webhooks"
+      BOT_RECORDING_SPOOL_DIRECTORY: "/attendee-recording-spool"
     entrypoint: []
     command: python manage.py run_scheduler
+    volumes:
+      - ${ATTENDEE_RECORDING_SPOOL_HOST_PATH:-/var/lib/attendee/recordings}:/attendee-recording-spool
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-989}"
     depends_on: [postgres, redis]
 
   postgres:

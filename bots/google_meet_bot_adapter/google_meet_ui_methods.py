@@ -896,7 +896,10 @@ class GoogleMeetUIMethods:
         logger.info("Clicking the join button...")
         self.click_element(join_button, "join_button")
 
-        self.click_captions_button()
+        if getattr(self, "should_enable_closed_captions", True):
+            self.click_captions_button()
+        else:
+            logger.info("Skipping Google Meet captions because in-meeting transcription is disabled")
 
         self.wait_for_host_if_needed()
 
