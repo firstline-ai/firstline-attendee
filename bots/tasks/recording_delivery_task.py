@@ -10,7 +10,7 @@ from pathlib import Path
 
 from celery import shared_task
 from django.conf import settings
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.db.models import F
 from django.utils import timezone
 
@@ -65,11 +65,7 @@ def enqueue_recording_delivery(recording_id: int) -> bool:
             return False
 
         active_cutoff = timezone.now() - timezone.timedelta(seconds=RECORDING_DELIVERY_ACTIVE_SECONDS)
-        if (
-            recording.delivery_state == RecordingDeliveryStates.UPLOADING
-            and recording.delivery_started_at
-            and recording.delivery_started_at > active_cutoff
-        ):
+        if recording.delivery_state == RecordingDeliveryStates.UPLOADING and recording.delivery_started_at and recording.delivery_started_at > active_cutoff:
             return False
 
         recording.delivery_state = RecordingDeliveryStates.STAGED
@@ -220,9 +216,7 @@ def _upload_external(recording: Recording, path: Path) -> str | None:
     if not bucket:
         return None
 
-    credentials_record = recording.bot.project.credentials.filter(
-        credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE
-    ).first()
+    credentials_record = recording.bot.project.credentials.filter(credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE).first()
     if not credentials_record:
         raise RuntimeError("External media storage credentials are not configured")
     credentials = credentials_record.get_credentials()
@@ -248,15 +242,14 @@ def _upload_external(recording: Recording, path: Path) -> str | None:
 
 def _claim_delivery(recording_id: int) -> Recording | None:
     with transaction.atomic():
-        recording = Recording.objects.select_for_update().select_related("bot__project").get(id=recording_id)
+        # Lock only the recording row. Locking the joined bot/project rows can
+        # deadlock with the bot shutdown transaction, which updates those rows
+        # while the delivery task is being published.
+        recording = Recording.objects.select_for_update(of=("self",)).select_related("bot__project").get(id=recording_id)
         if recording.delivery_state == RecordingDeliveryStates.READY:
             return None
         active_cutoff = timezone.now() - timezone.timedelta(seconds=RECORDING_DELIVERY_ACTIVE_SECONDS)
-        if (
-            recording.delivery_state == RecordingDeliveryStates.UPLOADING
-            and recording.delivery_started_at
-            and recording.delivery_started_at > active_cutoff
-        ):
+        if recording.delivery_state == RecordingDeliveryStates.UPLOADING and recording.delivery_started_at and recording.delivery_started_at > active_cutoff:
             return None
         recording.delivery_state = RecordingDeliveryStates.UPLOADING
         recording.delivery_started_at = timezone.now()
@@ -290,7 +283,7 @@ def _mark_ready(
     duration_ms: int,
 ) -> None:
     with transaction.atomic():
-        recording = Recording.objects.select_for_update().select_related("bot").get(id=recording_id)
+        recording = Recording.objects.select_for_update(of=("self",)).select_related("bot").get(id=recording_id)
         if recording.delivery_state == RecordingDeliveryStates.READY:
             return
         completed_at = timezone.now()
@@ -364,7 +357,26 @@ def cleanup_ready_recording_spool(recording_id: int) -> bool:
 @shared_task(bind=True, max_retries=MAX_RECORDING_DELIVERY_RETRIES)
 def deliver_recording(self, recording_id: int) -> None:
     """Validate, persist and announce one logical audio recording."""
-    recording = _claim_delivery(recording_id)
+    try:
+        recording = _claim_delivery(recording_id)
+    except OperationalError as exc:
+        # Database deadlocks and transient connection errors can happen while
+        # the bot shutdown transaction is committing. The staged spool file is
+        # durable, so retry the same idempotent task instead of waiting for the
+        # scheduler's slower recovery interval.
+        terminal = self.request.retries >= self.max_retries
+        if terminal:
+            _mark_failed(recording_id, exc, terminal=True)
+            logger.exception("Recording delivery could not claim recording %s after database retries", recording_id)
+            raise
+        countdown = min(300, 2 ** max(0, self.request.retries))
+        logger.warning(
+            "Recording delivery database claim failed for %s; retrying in %ss",
+            recording_id,
+            countdown,
+        )
+        raise self.retry(exc=exc, countdown=countdown)
+
     if recording is None:
         return
 
