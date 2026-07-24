@@ -60,6 +60,14 @@ def deliver_webhook(self, delivery_id):
         logger.error(f"Webhook delivery attempt {delivery_id} not found")
         raise  # Re-raises the original exception with preserved traceback
 
+    # Celery is at-least-once: the same message can be redelivered after it was
+    # already acknowledged by the destination. Do not send a completed logical
+    # delivery again. The stable idempotency key remains the downstream safety
+    # net for concurrent deliveries that were already in flight.
+    if delivery.status == WebhookDeliveryAttemptStatus.SUCCESS:
+        logger.info("Webhook delivery attempt %s already succeeded; skipping duplicate task", delivery_id)
+        return
+
     subscription = delivery.webhook_subscription
 
     # If the subscription is no longer active, mark as failed and return

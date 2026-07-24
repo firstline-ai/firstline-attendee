@@ -88,6 +88,10 @@ target/
 __pycache__/
 local_settings.py
 
-.env
+# Never send runtime credentials to the Docker build context. Keep only
+# committed, redacted templates available to image builds and documentation.
+.env*
+!.env.example
+!.env.prod.example
 db.sqlite3
 core
