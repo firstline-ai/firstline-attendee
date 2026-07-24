@@ -3,7 +3,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import docker
+from celery.exceptions import Retry
+from django.db import OperationalError, connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from accounts.models import Organization
@@ -21,7 +24,7 @@ from bots.models import (
     WebhookSubscription,
     WebhookTriggerTypes,
 )
-from bots.tasks.recording_delivery_task import cleanup_ready_recording_spool, deliver_recording, expected_spool_path, recover_recording_from_spool
+from bots.tasks.recording_delivery_task import _claim_delivery, cleanup_ready_recording_spool, deliver_recording, expected_spool_path, recover_recording_from_spool
 
 
 class RecordingDeliveryTaskTests(TestCase):
@@ -126,9 +129,7 @@ class RecordingDeliveryTaskTests(TestCase):
 
     @patch("bots.tasks.recording_delivery_task._enqueue_task", return_value=False)
     def test_orphaned_spool_file_is_preserved_and_marked_partial(self, _mock_enqueue):
-        with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
-            "os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}
-        ):
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict("os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}):
             path = expected_spool_path(self.recording)
             path.write_bytes(b"partial meeting audio")
 
@@ -141,15 +142,48 @@ class RecordingDeliveryTaskTests(TestCase):
             self.assertTrue(path.exists())
 
     def test_missing_orphaned_spool_file_records_a_bounded_recovery_attempt(self):
-        with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
-            "os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}
-        ):
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict("os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}):
             self.assertFalse(recover_recording_from_spool(self.recording.id))
 
         self.recording.refresh_from_db()
         self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.FAILED)
         self.assertEqual(self.recording.delivery_attempt_count, 1)
         self.assertEqual(self.recording.delivery_failure_data["error_type"], "RecordingSpoolUnavailable")
+
+    def test_claim_locks_only_the_recording_row(self):
+        self.recording.delivery_state = RecordingDeliveryStates.STAGED
+        self.recording.save(update_fields=["delivery_state", "updated_at"])
+
+        with CaptureQueriesContext(connection) as queries:
+            claimed = _claim_delivery(self.recording.id)
+
+        self.assertEqual(claimed.id, self.recording.id)
+        locking_queries = [query["sql"] for query in queries.captured_queries if "FOR UPDATE" in query["sql"]]
+        self.assertEqual(len(locking_queries), 1)
+        locking_query = locking_queries[0]
+        self.assertIn('FOR UPDATE OF "bots_recording"', locking_query)
+        self.assertNotIn('FOR UPDATE OF "bots_bot"', locking_query)
+        self.assertNotIn('FOR UPDATE OF "bots_project"', locking_query)
+
+    @patch(
+        "bots.tasks.recording_delivery_task._claim_delivery",
+        side_effect=OperationalError("deadlock detected"),
+    )
+    def test_database_deadlock_while_claiming_delivery_retries_immediately(self, _mock_claim):
+        self.recording.delivery_state = RecordingDeliveryStates.STAGED
+        self.recording.save(update_fields=["delivery_state", "updated_at"])
+
+        with patch.object(deliver_recording, "retry", side_effect=Retry()) as mock_retry:
+            with self.assertRaises(Retry):
+                deliver_recording.run(self.recording.id)
+
+        mock_retry.assert_called_once()
+        retry_kwargs = mock_retry.call_args.kwargs
+        self.assertIsInstance(retry_kwargs["exc"], OperationalError)
+        self.assertEqual(retry_kwargs["countdown"], 1)
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.STAGED)
+        self.assertEqual(self.recording.delivery_attempt_count, 0)
 
     @patch("bots.management.commands.run_scheduler.docker.from_env")
     def test_scheduler_marks_missing_recording_container_fatal_even_after_delivery(self, mock_docker_from_env):
