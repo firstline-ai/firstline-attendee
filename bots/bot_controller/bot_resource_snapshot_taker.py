@@ -412,6 +412,15 @@ class BotResourceSnapshotTaker:
             snapshot_data["public_ip"] = self._public_ip
         self._is_first_snapshot = False
 
-        BotResourceSnapshot.objects.create(bot=self.bot, data=snapshot_data)
+        try:
+            BotResourceSnapshot.objects.create(bot=self.bot, data=snapshot_data)
+        except Exception:
+            # Resource telemetry is best-effort and must never terminate the
+            # bot's main loop or interrupt a recording.
+            logger.exception(
+                "Failed to save resource snapshot for bot %s",
+                self.bot.object_id,
+            )
+            return
 
         logger.info(f"Saved resource snapshot for bot {self.bot.object_id}: {snapshot_data}")
