@@ -329,6 +329,27 @@ class WebhookDeliveryTest(TransactionTestCase):
         self.assertIsNotNone(attempt.succeeded_at)
 
     @patch("bots.tasks.deliver_webhook_task.requests.post")
+    def test_duplicate_task_does_not_redeliver_successful_webhook(self, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.text = "OK"
+        attempt = WebhookDeliveryAttempt.objects.create(
+            webhook_subscription=self.webhook_subscription,
+            webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE,
+            bot=self.bot,
+            idempotency_key=uuid.uuid4(),
+            payload={"test": "data"},
+        )
+
+        deliver_webhook.apply(args=[attempt.id])
+        deliver_webhook.apply(args=[attempt.id])
+
+        attempt.refresh_from_db()
+        mock_post.assert_called_once()
+        self.assertEqual(attempt.status, WebhookDeliveryAttemptStatus.SUCCESS)
+        self.assertEqual(attempt.attempt_count, 1)
+        self.assertEqual(len(attempt.response_body_list), 1)
+
+    @patch("bots.tasks.deliver_webhook_task.requests.post")
     def test_webhook_delivery_failure(self, mock_post):
         """Test webhook delivery failure and retry"""
         mock_post.return_value.status_code = 500

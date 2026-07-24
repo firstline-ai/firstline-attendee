@@ -24,7 +24,14 @@ from bots.models import (
     WebhookSubscription,
     WebhookTriggerTypes,
 )
-from bots.tasks.recording_delivery_task import _claim_delivery, cleanup_ready_recording_spool, deliver_recording, expected_spool_path, recover_recording_from_spool
+from bots.tasks.recording_delivery_task import (
+    MAX_RECORDING_DELIVERY_RETRIES,
+    _claim_delivery,
+    cleanup_ready_recording_spool,
+    deliver_recording,
+    expected_spool_path,
+    recover_recording_from_spool,
+)
 
 
 class RecordingDeliveryTaskTests(TestCase):
@@ -150,6 +157,59 @@ class RecordingDeliveryTaskTests(TestCase):
         self.assertEqual(self.recording.delivery_attempt_count, 1)
         self.assertEqual(self.recording.delivery_failure_data["error_type"], "RecordingSpoolUnavailable")
 
+    def test_empty_expected_spool_is_deleted_and_not_retried(self):
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict("os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}):
+            path = expected_spool_path(self.recording)
+            path.touch()
+            self.recording.local_file_path = str(path)
+            self.recording.save(update_fields=["local_file_path", "updated_at"])
+
+            self.assertFalse(recover_recording_from_spool(self.recording.id))
+
+            self.recording.refresh_from_db()
+            self.assertFalse(path.exists())
+            self.assertIsNone(self.recording.local_file_path)
+            self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.FAILED)
+            self.assertEqual(
+                self.recording.delivery_attempt_count,
+                MAX_RECORDING_DELIVERY_RETRIES,
+            )
+            self.assertEqual(self.recording.delivery_failure_data["error_type"], "RecordingSpoolEmpty")
+
+    def test_empty_symlink_at_expected_spool_path_is_never_deleted(self):
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict("os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}):
+            outside_path = Path(temp_directory).parent / f"outside-{self.recording.object_id}.mp3"
+            outside_path.touch()
+            expected_path = expected_spool_path(self.recording)
+            expected_path.symlink_to(outside_path)
+            try:
+                self.assertFalse(recover_recording_from_spool(self.recording.id))
+
+                self.recording.refresh_from_db()
+                self.assertTrue(expected_path.is_symlink())
+                self.assertTrue(outside_path.exists())
+                self.assertEqual(self.recording.delivery_attempt_count, 1)
+            finally:
+                expected_path.unlink(missing_ok=True)
+                outside_path.unlink(missing_ok=True)
+
+    def test_empty_file_outside_expected_spool_is_never_deleted(self):
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict("os.environ", {"BOT_RECORDING_SPOOL_DIRECTORY": temp_directory}):
+            outside_path = Path(temp_directory).parent / f"outside-{self.recording.object_id}.mp3"
+            outside_path.touch()
+            try:
+                self.recording.local_file_path = str(outside_path)
+                self.recording.save(update_fields=["local_file_path", "updated_at"])
+
+                self.assertFalse(recover_recording_from_spool(self.recording.id))
+
+                self.recording.refresh_from_db()
+                self.assertTrue(outside_path.exists())
+                self.assertEqual(self.recording.local_file_path, str(outside_path))
+                self.assertEqual(self.recording.delivery_attempt_count, 1)
+            finally:
+                outside_path.unlink(missing_ok=True)
+
     def test_claim_locks_only_the_recording_row(self):
         self.recording.delivery_state = RecordingDeliveryStates.STAGED
         self.recording.save(update_fields=["delivery_state", "updated_at"])
@@ -185,6 +245,34 @@ class RecordingDeliveryTaskTests(TestCase):
         self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.STAGED)
         self.assertEqual(self.recording.delivery_attempt_count, 0)
 
+    @patch("bots.tasks.recording_delivery_task._upload_primary", side_effect=RuntimeError("storage unavailable"))
+    @patch("bots.tasks.recording_delivery_task._repair_mp3_if_needed", return_value=12345)
+    def test_storage_unavailability_preserves_spool_and_retries(self, _mock_repair, _mock_primary):
+        with tempfile.TemporaryDirectory() as temp_directory:
+            path = Path(temp_directory) / "recording.mp3"
+            path.write_bytes(b"complete meeting audio")
+            self.recording.local_file_path = str(path)
+            self.recording.delivery_state = RecordingDeliveryStates.STAGED
+            self.recording.save(update_fields=["local_file_path", "delivery_state", "updated_at"])
+
+            with patch.object(deliver_recording, "retry", side_effect=Retry()) as mock_retry:
+                with self.assertRaises(Retry):
+                    deliver_recording.run(self.recording.id)
+
+            mock_retry.assert_called_once()
+            self.recording.refresh_from_db()
+            self.assertTrue(path.exists())
+            self.assertEqual(self.recording.local_file_path, str(path))
+            self.assertEqual(self.recording.delivery_state, RecordingDeliveryStates.STAGED)
+            self.assertEqual(self.recording.delivery_attempt_count, 1)
+            self.assertEqual(
+                WebhookDeliveryAttempt.objects.filter(
+                    bot=self.bot,
+                    webhook_trigger_type=WebhookTriggerTypes.RECORDING_READY,
+                ).count(),
+                0,
+            )
+
     @patch("bots.management.commands.run_scheduler.docker.from_env")
     def test_scheduler_marks_missing_recording_container_fatal_even_after_delivery(self, mock_docker_from_env):
         self.bot.state = BotStates.JOINED_RECORDING
@@ -205,6 +293,16 @@ class RecordingDeliveryTaskTests(TestCase):
         self.recording.delivery_state = RecordingDeliveryStates.STAGED
         self.recording.delivery_enqueued_at = None
         self.recording.save(update_fields=["delivery_state", "delivery_enqueued_at", "updated_at"])
+
+        Command()._run_pending_recording_deliveries()
+
+        mock_enqueue.assert_called_once_with(self.recording.id)
+
+    @patch("bots.management.commands.run_scheduler.enqueue_recording_delivery", return_value=True)
+    def test_scheduler_requeues_stale_upload_after_worker_interruption(self, mock_enqueue):
+        self.recording.delivery_state = RecordingDeliveryStates.UPLOADING
+        self.recording.delivery_started_at = timezone.now() - timezone.timedelta(minutes=20)
+        self.recording.save(update_fields=["delivery_state", "delivery_started_at", "updated_at"])
 
         Command()._run_pending_recording_deliveries()
 
