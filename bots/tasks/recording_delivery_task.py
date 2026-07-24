@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from django.utils import timezone
 from bots.bot_controller.azure_file_uploader import AzureFileUploader
 from bots.bot_controller.s3_file_uploader import S3FileUploader
 from bots.models import (
+    BotStates,
     Credentials,
     Recording,
     RecordingDeliveryStates,
@@ -38,6 +40,33 @@ def recording_spool_directory() -> Path:
 def expected_spool_path(recording: Recording) -> Path:
     filename = f"{recording.bot.object_id}-{recording.object_id}.{recording.bot.recording_format()}"
     return recording_spool_directory() / filename
+
+
+def _cleanup_empty_expected_spool(recording: Recording, path: Path) -> bool:
+    """Delete only an empty, regular file at this recording's deterministic path."""
+    if recording.bot.state not in BotStates.post_meeting_states():
+        return False
+
+    expected_path = expected_spool_path(recording)
+    if os.path.abspath(path) != os.path.abspath(expected_path):
+        return False
+
+    try:
+        file_stat = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != 0:
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.exception(
+            "Could not remove empty recording spool file for recording %s",
+            recording.id,
+        )
+        return False
+
+    logger.info("Removed empty recording spool file for recording %s", recording.id)
+    return True
 
 
 def _sanitized_failure_data(exc: Exception) -> dict:
@@ -109,26 +138,38 @@ def stage_recording_for_delivery(recording_id: int, local_file_path: str, *, is_
 
 def recover_recording_from_spool(recording_id: int) -> bool:
     """Stage an orphaned MP3 after the bot container died without cleanup."""
-    recording = Recording.objects.select_related("bot").get(id=recording_id)
-    path = Path(recording.local_file_path) if recording.local_file_path else expected_spool_path(recording)
-    try:
-        recoverable_file_exists = path.is_file() and path.stat().st_size > 0
-    except OSError:
-        recoverable_file_exists = False
-    if not recoverable_file_exists:
-        Recording.objects.filter(
-            id=recording.id,
-            delivery_state__in=[RecordingDeliveryStates.NOT_STARTED, RecordingDeliveryStates.FAILED],
-        ).update(
-            delivery_state=RecordingDeliveryStates.FAILED,
-            delivery_attempt_count=F("delivery_attempt_count") + 1,
-            delivery_failure_data={
-                "error_type": "RecordingSpoolUnavailable",
+    with transaction.atomic():
+        recording = Recording.objects.select_for_update(of=("self",)).select_related("bot").get(id=recording_id)
+        path = Path(recording.local_file_path) if recording.local_file_path else expected_spool_path(recording)
+        try:
+            file_size = path.stat().st_size if path.is_file() else None
+        except OSError:
+            file_size = None
+        if not file_size:
+            if recording.delivery_state not in [
+                RecordingDeliveryStates.NOT_STARTED,
+                RecordingDeliveryStates.FAILED,
+            ]:
+                return False
+            empty_spool_cleaned = file_size == 0 and _cleanup_empty_expected_spool(recording, path)
+            recording.delivery_state = RecordingDeliveryStates.FAILED
+            recording.delivery_attempt_count = MAX_RECORDING_DELIVERY_RETRIES if empty_spool_cleaned else F("delivery_attempt_count") + 1
+            recording.delivery_failure_data = {
+                "error_type": "RecordingSpoolEmpty" if file_size == 0 else "RecordingSpoolUnavailable",
                 "message": "Recording delivery failed; no recoverable local audio was found.",
-            },
-            updated_at=timezone.now(),
-        )
-        return False
+            }
+            if empty_spool_cleaned and recording.local_file_path == str(path):
+                recording.local_file_path = None
+            recording.save(
+                update_fields=[
+                    "delivery_state",
+                    "delivery_attempt_count",
+                    "delivery_failure_data",
+                    "local_file_path",
+                    "updated_at",
+                ]
+            )
+            return False
     return stage_recording_for_delivery(recording.id, str(path), is_partial=True)
 
 
