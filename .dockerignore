@@ -92,6 +92,6 @@ local_settings.py
 # committed, redacted templates available to image builds and documentation.
 .env*
 !.env.example
-!.env.*.example
+!.env.prod.example
 db.sqlite3
 core
