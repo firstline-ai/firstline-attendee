@@ -6,6 +6,7 @@ import random
 import signal
 import time
 
+import docker
 import redis
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -14,9 +15,29 @@ from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import (
+    Bot,
+    BotEventManager,
+    BotEventSubTypes,
+    BotEventTypes,
+    BotStates,
+    Calendar,
+    CalendarStates,
+    Recording,
+    RecordingDeliveryStates,
+    TranscriptionTypes,
+    ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
+)
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
+from bots.tasks.recording_delivery_task import (
+    MAX_RECORDING_DELIVERY_RETRIES,
+    RECORDING_DELIVERY_ACTIVE_SECONDS,
+    cleanup_ready_recording_spool,
+    enqueue_recording_delivery,
+    recover_recording_from_spool,
+)
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
 from bots.tasks.sync_calendar_task import enqueue_sync_calendar_task
 from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_connection_task
@@ -24,6 +45,8 @@ from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_c
 log = logging.getLogger(__name__)
 
 CALENDAR_SYNC_THRESHOLD_HOURS = 24  # The longest a calendar can go without having been synced
+RECORDING_DELIVERY_REENQUEUE_SECONDS = int(os.getenv("RECORDING_DELIVERY_REENQUEUE_SECONDS", 300))
+RECORDING_ORPHAN_RECOVERY_GRACE_SECONDS = int(os.getenv("RECORDING_ORPHAN_RECOVERY_GRACE_SECONDS", 120))
 
 
 class Command(BaseCommand):
@@ -86,6 +109,7 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
+                self._run_pending_recording_deliveries()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
@@ -291,3 +315,122 @@ class Command(BaseCommand):
             enqueue_autopay_charge_task(organization)
 
         log.info("Enqueued %d autopay tasks", len(organizations))
+
+    def _run_pending_recording_deliveries(self):
+        """Recover finalized or orphaned audio after a bot/container failure."""
+        now = timezone.now()
+        self._mark_crashed_recording_only_bots(now)
+        reenqueue_cutoff = now - timezone.timedelta(seconds=RECORDING_DELIVERY_REENQUEUE_SECONDS)
+        active_cutoff = now - timezone.timedelta(seconds=RECORDING_DELIVERY_ACTIVE_SECONDS)
+        orphan_cutoff = now - timezone.timedelta(seconds=RECORDING_ORPHAN_RECOVERY_GRACE_SECONDS)
+
+        ready_with_local_spool = (
+            Recording.objects.filter(
+                transcription_type=TranscriptionTypes.NO_TRANSCRIPTION,
+                delivery_state=RecordingDeliveryStates.READY,
+                local_file_path__isnull=False,
+            )
+            .exclude(local_file_path="")
+            .order_by("updated_at")
+            .values_list("id", flat=True)[:100]
+        )
+        cleaned = 0
+        for recording_id in ready_with_local_spool:
+            try:
+                if cleanup_ready_recording_spool(recording_id):
+                    cleaned += 1
+            except Exception:
+                log.exception("Could not clean delivered spool file for recording %s", recording_id)
+
+        pending = (
+            Recording.objects.filter(transcription_type=TranscriptionTypes.NO_TRANSCRIPTION)
+            .filter(
+                Q(delivery_state=RecordingDeliveryStates.STAGED)
+                & (
+                    Q(delivery_enqueued_at__isnull=True)
+                    | Q(delivery_enqueued_at__lte=reenqueue_cutoff)
+                )
+                | Q(delivery_state=RecordingDeliveryStates.UPLOADING)
+                & (
+                    Q(delivery_started_at__isnull=True)
+                    | Q(delivery_started_at__lte=active_cutoff)
+                )
+            )
+            .order_by("updated_at")[:100]
+        )
+        requeued = 0
+        for recording in pending:
+            if enqueue_recording_delivery(recording.id):
+                requeued += 1
+
+        orphaned = (
+            Recording.objects.filter(
+                transcription_type=TranscriptionTypes.NO_TRANSCRIPTION,
+                bot__state__in=BotStates.post_meeting_states(),
+                bot__updated_at__lte=orphan_cutoff,
+                delivery_state__in=[RecordingDeliveryStates.NOT_STARTED, RecordingDeliveryStates.FAILED],
+                delivery_attempt_count__lt=MAX_RECORDING_DELIVERY_RETRIES,
+            )
+            .select_related("bot")
+            .order_by("updated_at")[:100]
+        )
+        recovered = 0
+        for recording in orphaned:
+            try:
+                if recover_recording_from_spool(recording.id):
+                    recovered += 1
+            except Exception:
+                log.exception("Could not recover recording %s from the durable spool", recording.id)
+
+        log.info(
+            "Cleaned %d delivered spool file(s); requeued %d recording delivery task(s); recovered %d orphaned recording(s)",
+            cleaned,
+            requeued,
+            recovered,
+        )
+
+    def _mark_crashed_recording_only_bots(self, now):
+        """Move a stale bot to fatal only after Docker confirms it is gone."""
+        stale_heartbeat = int(now.timestamp()) - 600
+        candidates = (
+            Bot.objects.filter(
+                recordings__is_default_recording=True,
+                recordings__transcription_type=TranscriptionTypes.NO_TRANSCRIPTION,
+                last_heartbeat_timestamp__isnull=False,
+                last_heartbeat_timestamp__lt=stale_heartbeat,
+            )
+            .exclude(state__in=BotStates.post_meeting_states())
+            .distinct()
+            .order_by("last_heartbeat_timestamp")[:50]
+        )
+        if not candidates:
+            return
+
+        try:
+            docker_client = docker.from_env()
+        except Exception:
+            log.exception("Cannot inspect Docker while recovering recording-only bots")
+            return
+
+        for bot in candidates:
+            try:
+                container = docker_client.containers.get(bot.ephemeral_container_name())
+                container.reload()
+                if container.status == "running":
+                    continue
+            except docker.errors.NotFound:
+                pass
+            except Exception:
+                log.exception("Cannot inspect container for recording-only bot %s", bot.object_id)
+                continue
+
+            try:
+                BotEventManager.create_event(
+                    bot=bot,
+                    event_type=BotEventTypes.FATAL_ERROR,
+                    event_sub_type=BotEventSubTypes.FATAL_ERROR_HEARTBEAT_TIMEOUT,
+                    event_metadata={"recording_recovery": "container_missing_after_stale_heartbeat"},
+                )
+                log.warning("Marked crashed recording-only bot %s as fatal for audio recovery", bot.object_id)
+            except Exception:
+                log.exception("Could not mark recording-only bot %s as fatal", bot.object_id)

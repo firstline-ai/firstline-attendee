@@ -1067,6 +1067,13 @@ class Bot(models.Model):
             recording_settings = {}
         return recording_settings.get("format", RecordingFormats.MP4)
 
+    def transcription_is_disabled(self):
+        transcription_settings = self.settings.get("transcription_settings", {}) or {}
+        return "none" in transcription_settings
+
+    def uses_durable_recording_spool(self):
+        return self.transcription_is_disabled() and self.recording_type() == RecordingTypes.AUDIO_ONLY
+
     def record_chat_messages_when_paused(self):
         recording_settings = self.settings.get("recording_settings", {})
         if recording_settings is None:
@@ -1080,6 +1087,10 @@ class Bot(models.Model):
         return recording_settings.get("reserve_additional_storage", False)
 
     def record_async_transcription_audio_chunks(self):
+        # Recording-only bots must never initialize the legacy per-participant
+        # chunk pipeline, even if an older client persisted this flag as true.
+        if self.transcription_is_disabled():
+            return False
         if not self.project.organization.is_async_transcription_enabled:
             return False
         recording_settings = self.settings.get("recording_settings", {})
@@ -2248,6 +2259,24 @@ class TranscriptionProviders(models.IntegerChoices):
     CUSTOM_ASYNC = 9, "Custom Async"
 
 
+class RecordingDeliveryStates(models.IntegerChoices):
+    NOT_STARTED = 1, "Not Started"
+    STAGED = 2, "Staged"
+    UPLOADING = 3, "Uploading"
+    READY = 4, "Ready"
+    FAILED = 5, "Failed"
+
+    @classmethod
+    def state_to_api_code(cls, value):
+        return {
+            cls.NOT_STARTED: "not_started",
+            cls.STAGED: "staged",
+            cls.UPLOADING: "uploading",
+            cls.READY: "ready",
+            cls.FAILED: "failed",
+        }.get(value)
+
+
 class RecordingStorage(Storage):
     """
     Returns the configured 'recordings' storage from Django's registry.
@@ -2286,6 +2315,26 @@ class Recording(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
     first_buffer_timestamp_ms = models.BigIntegerField(null=True, blank=True)
 
+    # A recording-only bot first writes to a host-mounted spool. Delivery is
+    # independent from the browser container so a partial MP3 survives a crash.
+    delivery_state = models.IntegerField(
+        choices=RecordingDeliveryStates.choices,
+        default=RecordingDeliveryStates.NOT_STARTED,
+        null=False,
+    )
+    delivery_attempt_count = models.IntegerField(default=0, null=False)
+    delivery_requested_at = models.DateTimeField(null=True, blank=True)
+    delivery_enqueued_at = models.DateTimeField(null=True, blank=True)
+    delivery_started_at = models.DateTimeField(null=True, blank=True)
+    delivery_completed_at = models.DateTimeField(null=True, blank=True)
+    delivery_failure_data = models.JSONField(null=True, default=None)
+    local_file_path = models.CharField(max_length=1024, null=True, blank=True)
+    file_size_bytes = models.BigIntegerField(null=True, blank=True)
+    file_sha256 = models.CharField(max_length=64, null=True, blank=True)
+    duration_ms = models.BigIntegerField(null=True, blank=True)
+    is_partial = models.BooleanField(default=False, null=False)
+    external_storage_key = models.CharField(max_length=1024, null=True, blank=True)
+
     file = models.FileField(storage=RecordingStorage())
 
     def __str__(self):
@@ -2298,6 +2347,32 @@ class Recording(models.Model):
 
         if settings.STORAGE_PROTOCOL == "azure":
             return self.file.url
+
+        public_endpoint = getattr(settings, "AWS_RECORDING_PUBLIC_ENDPOINT_URL", None)
+        if public_endpoint:
+            import boto3
+            from botocore.config import Config
+
+            storage_options = settings.RECORDING_STORAGE_BACKEND.get("OPTIONS", {})
+            public_client = boto3.client(
+                "s3",
+                endpoint_url=public_endpoint,
+                aws_access_key_id=storage_options.get("access_key"),
+                aws_secret_access_key=storage_options.get("secret_key"),
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+                config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": settings.AWS_S3_ADDRESSING_STYLE},
+                ),
+            )
+            return public_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
+                    "Key": self.file.name,
+                },
+                ExpiresIn=1800,
+            )
 
         # Generate a temporary signed URL that expires in 30 minutes (1800 seconds)
         return self.file.storage.bucket.meta.client.generate_presigned_url(
@@ -3080,6 +3155,7 @@ class WebhookTriggerTypes(models.IntegerChoices):
     ZOOM_OAUTH_CONNECTION_STATE_CHANGE = 8, "Zoom OAuth Connection State Change"
     BOT_LOGS_UPDATE = 9, "Bot Logs Update"
     PARTICIPANT_EVENTS_SPEECH_START_STOP = 10, "Participant Speech Start/Stop"
+    RECORDING_READY = 11, "Recording Ready"
     # add other event types here
 
     @classmethod
@@ -3096,6 +3172,7 @@ class WebhookTriggerTypes(models.IntegerChoices):
             cls.ZOOM_OAUTH_CONNECTION_STATE_CHANGE: "zoom_oauth_connection.state_change",
             cls.BOT_LOGS_UPDATE: "bot_logs.update",
             cls.PARTICIPANT_EVENTS_SPEECH_START_STOP: "participant_events.speech_start_stop",
+            cls.RECORDING_READY: "recording.ready",
         }
 
     @classmethod

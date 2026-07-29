@@ -197,6 +197,9 @@ CELERY_TASK_ROUTES = {
     "bots.tasks.deliver_webhook_task.deliver_webhook": {
         "queue": os.getenv("DELIVER_WEBHOOK_CELERY_QUEUE", "celery"),
     },
+    "bots.tasks.recording_delivery_task.deliver_recording": {
+        "queue": os.getenv("RECORDING_DELIVERY_CELERY_QUEUE", "celery"),
+    },
 }
 
 if os.getenv("LAUNCH_BOT_METHOD") != "kubernetes" and os.getenv("LAUNCH_BOT_METHOD") != "docker-compose-multi-host":
@@ -248,6 +251,12 @@ LOG_FORMATTERS = {
 # Use s3 by default, but if the STORAGE_PROTOCOL env var is set to "azure", use azure storage
 STORAGE_PROTOCOL = os.getenv("STORAGE_PROTOCOL", "s3")
 AWS_RECORDING_STORAGE_BUCKET_NAME = os.getenv("AWS_RECORDING_STORAGE_BUCKET_NAME")
+AWS_RECORDING_PUBLIC_ENDPOINT_URL = os.getenv("AWS_RECORDING_PUBLIC_ENDPOINT_URL")
+AWS_S3_ADDRESSING_STYLE = (
+    "virtual"
+    if os.getenv("USE_IRSA_FOR_S3_STORAGE", "false") == "true"
+    else os.getenv("AWS_S3_ADDRESSING_STYLE", "path")
+)
 AZURE_RECORDING_STORAGE_CONTAINER_NAME = os.getenv("AZURE_RECORDING_STORAGE_CONTAINER_NAME")
 
 # Audio chunk storage settings
@@ -278,6 +287,7 @@ else:
             "endpoint_url": os.getenv("AWS_ENDPOINT_URL"),
             "access_key": os.getenv("AWS_ACCESS_KEY_ID"),
             "secret_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+            "addressing_style": AWS_S3_ADDRESSING_STYLE,
         },
     }
     # Deep copy the DEFAULT_STORAGE_BACKEND
@@ -298,8 +308,6 @@ STORAGES = {
     },
 }
 AWS_S3_SIGNATURE_VERSION = "s3v4"
-if os.getenv("USE_IRSA_FOR_S3_STORAGE", "false") == "true":
-    AWS_S3_ADDRESSING_STYLE = "virtual"
 
 CHARGE_CREDITS_FOR_BOTS = os.getenv("CHARGE_CREDITS_FOR_BOTS", "false") == "true"
 
