@@ -21,6 +21,7 @@ class MinimalGoogleMeetAdapter(GoogleMeetUIMethods):
         self.disable_incoming_video = False
         self.google_meet_closed_captions_language = None
         self.upsert_caption_callback = None
+        self.should_enable_closed_captions = False
         self.ready_to_show_bot_image = MagicMock(return_value=None)
 
 
@@ -81,6 +82,7 @@ class TestGoogleMeetUIMethods(TestCase):
     ):
         adapter = MinimalGoogleMeetAdapter()
         adapter.upsert_caption_callback = MagicMock()
+        adapter.should_enable_closed_captions = True
         adapter.wait_until_admitted_to_meeting_without_captions = MagicMock(return_value=None)
 
         adapter.attempt_to_join_meeting()

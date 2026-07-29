@@ -2348,6 +2348,32 @@ class Recording(models.Model):
         if settings.STORAGE_PROTOCOL == "azure":
             return self.file.url
 
+        public_endpoint = getattr(settings, "AWS_RECORDING_PUBLIC_ENDPOINT_URL", None)
+        if public_endpoint:
+            import boto3
+            from botocore.config import Config
+
+            storage_options = settings.RECORDING_STORAGE_BACKEND.get("OPTIONS", {})
+            public_client = boto3.client(
+                "s3",
+                endpoint_url=public_endpoint,
+                aws_access_key_id=storage_options.get("access_key"),
+                aws_secret_access_key=storage_options.get("secret_key"),
+                region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+                config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": settings.AWS_S3_ADDRESSING_STYLE},
+                ),
+            )
+            return public_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
+                    "Key": self.file.name,
+                },
+                ExpiresIn=1800,
+            )
+
         # Generate a temporary signed URL that expires in 30 minutes (1800 seconds)
         return self.file.storage.bucket.meta.client.generate_presigned_url(
             "get_object",

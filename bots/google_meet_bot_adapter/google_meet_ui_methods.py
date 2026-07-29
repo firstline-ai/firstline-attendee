@@ -260,9 +260,6 @@ class GoogleMeetUIMethods:
                 logger.warning(f"Could not find name input. Unknown error {e} of type {type(e)}. Raising UiCouldNotLocateElementException")
                 raise UiCouldNotLocateElementException("Could not find name input. Unknown error.", "name_input", e)
 
-    def should_enable_closed_captions(self):
-        return self.upsert_caption_callback is not None or self.google_meet_closed_captions_language is not None
-
     def wait_until_admitted_to_meeting_without_captions(self):
         num_attempts_to_look_for_leave_button = self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
         logger.info("Waiting to be admitted without requiring captions...")
@@ -933,7 +930,7 @@ class GoogleMeetUIMethods:
         logger.info("Clicking the join button...")
         self.click_element(join_button, "join_button")
 
-        if self.should_enable_closed_captions():
+        if getattr(self, "should_enable_closed_captions", True):
             self.click_captions_button()
         else:
             self.wait_until_admitted_to_meeting_without_captions()

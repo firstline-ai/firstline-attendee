@@ -10,7 +10,7 @@
 
 services:
   attendee-app:
-    image: firstline-attendee:latest
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod
@@ -24,7 +24,7 @@ services:
     depends_on: [postgres, redis]
 
   attendee-worker:
-    image: firstline-attendee:latest
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod
@@ -86,7 +86,7 @@ services:
     depends_on: [postgres, redis]
 
   attendee-scheduler:
-    image: firstline-attendee:latest
+    image: ${ATTENDEE_RELEASE_IMAGE:?Set ATTENDEE_RELEASE_IMAGE to an immutable Attendee image tag}
     restart: always
     network_mode: host
     env_file: .env.prod

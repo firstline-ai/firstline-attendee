@@ -1,11 +1,12 @@
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import docker
 from celery.exceptions import Retry
 from django.db import OperationalError, connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -336,3 +337,32 @@ class RecordingDeliveryTaskTests(TestCase):
             self.recording.refresh_from_db()
             self.assertEqual(self.recording.local_file_path, str(path))
             self.assertTrue(path.exists())
+
+    @override_settings(
+        STORAGE_PROTOCOL="s3",
+        AWS_RECORDING_PUBLIC_ENDPOINT_URL="https://media-qa.example.test",
+        AWS_RECORDING_STORAGE_BUCKET_NAME="attendee-recordings",
+        AWS_S3_ADDRESSING_STYLE="path",
+        RECORDING_STORAGE_BACKEND={
+            "OPTIONS": {
+                "access_key": "test-access",
+                "secret_key": "test-secret",
+            }
+        },
+    )
+    @patch("boto3.client")
+    def test_recording_url_uses_public_endpoint_instead_of_internal_minio(self, mock_client):
+        mock_client.return_value.generate_presigned_url.return_value = (
+            "https://media-qa.example.test/attendee-recordings/primary/test.mp3?signed=1"
+        )
+        recording = SimpleNamespace(
+            file=SimpleNamespace(name="primary/test.mp3"),
+        )
+
+        url = Recording.url.fget(recording)
+
+        self.assertTrue(url.startswith("https://media-qa.example.test/"))
+        self.assertEqual(
+            mock_client.call_args.kwargs["endpoint_url"],
+            "https://media-qa.example.test",
+        )

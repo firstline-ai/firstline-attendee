@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("bots", "0085_utterance_transcription_claim"),
+        ("bots", "0084_botmediarequest_mute_video"),
     ]
 
     operations = [

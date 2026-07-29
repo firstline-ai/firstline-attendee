@@ -56,7 +56,7 @@ local antes de apagar o spool.
 
 ## Preparação do host
 
-Esta release exige a migration `0086_recording_only_delivery` e um diretório
+Esta release exige a migration `0085_recording_only_delivery` e um diretório
 persistente. Criar o diretório antes de iniciar os containers:
 
 ```bash
@@ -70,7 +70,14 @@ ATTENDEE_RECORDING_SPOOL_HOST_PATH=/var/lib/attendee/recordings
 BOT_RECORDING_SPOOL_DIRECTORY=/attendee-recording-spool
 RECORDING_DELIVERY_REENQUEUE_SECONDS=300
 RECORDING_ORPHAN_RECOVERY_GRACE_SECONDS=120
+AWS_ENDPOINT_URL=http://localhost:9000
+AWS_RECORDING_PUBLIC_ENDPOINT_URL=https://<dominio-publico-minio-qa>
+AWS_S3_ADDRESSING_STYLE=path
 ```
+
+`AWS_ENDPOINT_URL` é usado internamente para upload. A URL assinada devolvida
+pela API é gerada com `AWS_RECORDING_PUBLIC_ENDPOINT_URL`; ela precisa ser HTTPS
+e alcançável pelo backend FirstLine. Não use `localhost` no endpoint público.
 
 Não ativar o novo contrato antes de aplicar a migration e confirmar o bind
 mount com `docker compose config`. A migration somente adiciona colunas de
